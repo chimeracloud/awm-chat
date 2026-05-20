@@ -31,7 +31,7 @@ class Settings:
     CONTEXT_WINDOW_MESSAGES: int = int(os.getenv("CONTEXT_WINDOW_MESSAGES", "40"))
     CORS_ORIGINS: list[str] = os.getenv(
         "CORS_ORIGINS",
-        "https://chat.ascotwm.com,http://localhost:5173",
+        "https://chat.chimerasportstrading.com,https://awm-chat.pages.dev,http://localhost:5173",
     ).split(",")
     FLAG_KEYWORDS: list[str] = [
         w.strip().lower() for w in os.getenv(

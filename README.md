@@ -8,7 +8,7 @@ A private, sleek, company-internal chat interface to Claude with:
 
 * Google Workspace SSO restricted to `@ascotwm.com`
 * Per-user conversation history with pinned context
-* Server-side RAG (Phase 2) for effectively unlimited memory
+* Server-side RAG (Phase 2) for effectively unlimited memory for user
 * Token usage tracking and per-user monthly spend caps
 * Admin dashboard with usage metrics and content review hooks
 * Compliance audit trail: chats are company property and subject to spot checks too
