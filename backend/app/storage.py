@@ -43,3 +43,24 @@ def append_to_archive(uid: str, conv_id: str, payload: dict) -> None:
 def month_key(d: datetime | None = None) -> str:
     d = d or now()
     return f"{d.year:04d}-{d.month:02d}"
+
+
+def get_global_settings() -> dict:
+    """Admin-configurable settings stored in Firestore, seeded from env defaults.
+
+    Lives at settings/global. Returns env-based defaults merged with any
+    admin overrides, so missing keys always resolve to a sane value.
+    """
+    s = get_settings()
+    defaults = {
+        "default_model": s.CLAUDE_MODEL,
+        "available_models": [s.CLAUDE_MODEL],
+        "default_cap_tokens": s.DEFAULT_CAP_TOKENS,
+        "flag_keywords": list(s.FLAG_KEYWORDS),
+    }
+    ref = db().collection("settings").document("global")
+    snap = ref.get()
+    if snap.exists:
+        return {**defaults, **(snap.to_dict() or {})}
+    ref.set(defaults)
+    return defaults

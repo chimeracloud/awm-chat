@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from .auth import AuthedUser, require_user
 from .config import get_settings
-from .storage import db, append_to_archive, month_key, now
+from .storage import db, append_to_archive, get_global_settings, month_key, now
 
 router = APIRouter()
 
@@ -19,9 +19,9 @@ class ChatRequest(BaseModel):
     message: str
 
 
-def _scan_for_flags(text: str) -> list[str]:
+def _scan_for_flags(text: str, keywords: list[str]) -> list[str]:
     s = text.lower()
-    return [kw for kw in get_settings().FLAG_KEYWORDS if kw in s]
+    return [kw for kw in keywords if kw and kw in s]
 
 
 def _build_system_prompt(uid: str, profile: dict) -> str:
@@ -77,6 +77,7 @@ async def chat(
     user: Annotated[AuthedUser, Depends(require_user)],
 ):
     settings = get_settings()
+    global_cfg = get_global_settings()
     profile_ref = db().collection("users").document(user.uid)
     profile = profile_ref.get().to_dict() or {}
 
@@ -110,7 +111,7 @@ async def chat(
     })
 
     # Flag check on the user message
-    flags = _scan_for_flags(body.message)
+    flags = _scan_for_flags(body.message, global_cfg.get("flag_keywords") or settings.FLAG_KEYWORDS)
     if flags:
         db().collection("audit").document().set({
             "type": "flag",
@@ -128,6 +129,7 @@ async def chat(
 
     history = _load_history(user.uid, body.conversation_id)
     system_prompt = _build_system_prompt(user.uid, profile)
+    model = profile.get("model") or global_cfg.get("default_model") or settings.CLAUDE_MODEL
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -138,7 +140,7 @@ async def chat(
 
         try:
             with client.messages.stream(
-                model=settings.CLAUDE_MODEL,
+                model=model,
                 max_tokens=settings.MAX_OUTPUT_TOKENS,
                 system=system_prompt,
                 messages=history,

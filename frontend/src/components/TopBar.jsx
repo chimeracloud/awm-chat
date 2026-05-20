@@ -1,7 +1,9 @@
 import { Pin, LogOut, Settings } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { signOut } from '../lib/firebase'
 
 export default function TopBar({ user, profile, usage, onTogglePins, pinsActive }) {
+  const navigate = useNavigate()
   const pct = usage && usage.cap_tokens ? Math.min(100, (usage.tokens_used / usage.cap_tokens) * 100) : 0
   const pctBand = pct < 60 ? 'bg-accent-success' : pct < 85 ? 'bg-gold-500' : 'bg-accent-danger'
 
@@ -37,6 +39,16 @@ export default function TopBar({ user, profile, usage, onTogglePins, pinsActive 
           <Pin size={13} />
           Pinned context
         </button>
+
+        {profile?.role === 'admin' && (
+          <button
+            onClick={() => navigate('/admin')}
+            className="text-ink-300 hover:text-cream-100 transition-colors"
+            title="Admin"
+          >
+            <Settings size={16} />
+          </button>
+        )}
 
         <button
           onClick={() => signOut()}
