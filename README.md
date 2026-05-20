@@ -7,7 +7,7 @@ Internal Claude-powered chat application for Ascot Wealth Management.
 A private, sleek, company-internal chat interface to Claude with:
 
 * Google Workspace SSO restricted to `@ascotwm.com`
-* Per-user conversation history with pinned context
+* Per-user conversation history with pinned context.
 * Server-side RAG (Phase 2) for effectively unlimited memory for user
 * Token usage tracking and per-user monthly spend caps
 * Admin dashboard with usage metrics and content review hooks
