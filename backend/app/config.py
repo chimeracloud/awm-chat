@@ -22,6 +22,7 @@ def _get_secret(name: str) -> str:
 
 class Settings:
     GCP_PROJECT: str = os.getenv("GCP_PROJECT", "awm-chat-prod")
+    FIRESTORE_DATABASE: str = os.getenv("FIRESTORE_DATABASE", "(default)")
     GCS_ARCHIVE_BUCKET: str = os.getenv("GCS_ARCHIVE_BUCKET", "awm-chat-archive")
     ALLOWED_EMAIL_DOMAIN: str = os.getenv("ALLOWED_EMAIL_DOMAIN", "ascotwm.com")
     DEFAULT_CAP_TOKENS: int = int(os.getenv("DEFAULT_CAP_TOKENS", "500000"))

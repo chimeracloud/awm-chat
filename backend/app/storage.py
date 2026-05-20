@@ -10,7 +10,8 @@ from .config import get_settings
 
 @lru_cache
 def db() -> firestore.Client:
-    return firestore.Client(project=get_settings().GCP_PROJECT)
+    settings = get_settings()
+    return firestore.Client(project=settings.GCP_PROJECT, database=settings.FIRESTORE_DATABASE)
 
 
 @lru_cache
