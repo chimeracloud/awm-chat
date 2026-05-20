@@ -11,7 +11,7 @@ A private, sleek, company-internal chat interface to Claude with:
 * Server-side RAG (Phase 2) for effectively unlimited memory
 * Token usage tracking and per-user monthly spend caps
 * Admin dashboard with usage metrics and content review hooks
-* Compliance audit trail: chats are company property and subject to spot checks
+* Compliance audit trail: chats are company property and subject to spot checks too
 * All data flows into a GCS-backed data lake for analytics and BigQuery reporting
 
 ## Architecture
