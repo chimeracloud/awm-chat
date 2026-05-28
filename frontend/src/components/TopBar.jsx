@@ -1,4 +1,4 @@
-import { Pin, LogOut, Settings } from 'lucide-react'
+import { Pin, LogOut, Settings, HelpCircle } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { signOut } from '../lib/firebase'
 
@@ -38,6 +38,14 @@ export default function TopBar({ user, profile, usage, onTogglePins, pinsActive 
         >
           <Pin size={13} />
           Pinned context
+        </button>
+
+        <button
+          onClick={() => navigate('/help')}
+          className="text-ink-300 hover:text-cream-100 transition-colors"
+          title="User manual"
+        >
+          <HelpCircle size={16} />
         </button>
 
         {profile?.role === 'admin' && (

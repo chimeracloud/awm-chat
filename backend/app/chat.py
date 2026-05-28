@@ -7,6 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from .attachments import (
+    build_content_blocks,
+    flag_scan_corpus,
+    lightweight_attachment,
+    load_attachments_full,
+)
 from .auth import AuthedUser, require_user
 from .config import get_settings
 from .storage import db, append_to_archive, get_global_settings, month_key, now
@@ -17,6 +23,7 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     conversation_id: str
     message: str
+    attachment_ids: list[str] | None = None
 
 
 def _scan_for_flags(text: str, keywords: list[str]) -> list[str]:
@@ -62,7 +69,23 @@ def _load_history(uid: str, conv_id: str) -> list[dict]:
 
     items = [m.to_dict() for m in raw]
     items.reverse()
-    return [{"role": m["role"], "content": m["content"]} for m in items if m.get("content")]
+
+    history: list[dict] = []
+    for m in items:
+        att_refs = m.get("attachments") or []
+        text = m.get("content") or ""
+        if not text and not att_refs:
+            continue
+        if not att_refs:
+            history.append({"role": m["role"], "content": text})
+            continue
+        ids = [a.get("id") for a in att_refs if a.get("id")]
+        atts_full = load_attachments_full(uid, ids)
+        history.append({
+            "role": m["role"],
+            "content": build_content_blocks(text, atts_full),
+        })
+    return history
 
 
 def firestore_desc():
@@ -80,6 +103,21 @@ async def chat(
     global_cfg = get_global_settings()
     profile_ref = db().collection("users").document(user.uid)
     profile = profile_ref.get().to_dict() or {}
+
+    # Validate input — message must have text or at least one attachment
+    if not body.message.strip() and not body.attachment_ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Empty message")
+
+    # Load any referenced attachments up front so we can validate and reuse
+    attachments_full = load_attachments_full(user.uid, body.attachment_ids or [])
+    if body.attachment_ids and len(attachments_full) != len(body.attachment_ids):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "One or more attachments not found")
+    for att in attachments_full:
+        if att.get("status") != "ready":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Attachment {att.get('id')} is not ready (status: {att.get('status')})",
+            )
 
     # Usage cap check
     mkey = month_key()
@@ -101,6 +139,7 @@ async def chat(
     user_msg_ref.set({
         "role": "user",
         "content": body.message,
+        "attachments": [lightweight_attachment(a) for a in attachments_full],
         "created_at": now(),
         "uid": user.uid,
     })
@@ -110,8 +149,11 @@ async def chat(
         "updated_at": now(),
     })
 
-    # Flag check on the user message
-    flags = _scan_for_flags(body.message, global_cfg.get("flag_keywords") or settings.FLAG_KEYWORDS)
+    # Flag check across the user's text + any extracted document text / video transcripts
+    flags = _scan_for_flags(
+        flag_scan_corpus(body.message, attachments_full),
+        global_cfg.get("flag_keywords") or settings.FLAG_KEYWORDS,
+    )
     if flags:
         db().collection("audit").document().set({
             "type": "flag",
@@ -124,7 +166,12 @@ async def chat(
             "created_at": now(),
         })
 
-    archive_payload = {"role": "user", "content": body.message, "uid": user.uid}
+    archive_payload = {
+        "role": "user",
+        "content": body.message,
+        "uid": user.uid,
+        "attachments": [lightweight_attachment(a) for a in attachments_full],
+    }
     append_to_archive(user.uid, body.conversation_id, archive_payload)
 
     history = _load_history(user.uid, body.conversation_id)

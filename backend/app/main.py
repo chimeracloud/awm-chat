@@ -5,10 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .api import router as api_router
 from .chat import router as chat_router
+from .attachments import router as attachments_router
 
 settings = get_settings()
 
-app = FastAPI(title="AWM Chat API", version="0.1.0")
+app = FastAPI(title="AWM Chat API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,6 +27,7 @@ async def health():
 
 app.include_router(api_router)
 app.include_router(chat_router, prefix="/chat")
+app.include_router(attachments_router, prefix="/attachments")
 
 
 # Empty init file marker

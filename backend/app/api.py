@@ -124,6 +124,7 @@ async def list_messages(conv_id: str, user: Annotated[AuthedUser, Depends(requir
             "id": s.id,
             "role": d.get("role"),
             "content": d.get("content"),
+            "attachments": d.get("attachments"),
             "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
             "input_tokens": d.get("input_tokens"),
             "output_tokens": d.get("output_tokens"),

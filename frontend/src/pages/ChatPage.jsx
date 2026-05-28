@@ -51,19 +51,27 @@ export default function ChatPage({ user, profile }) {
   useEffect(() => { loadConversations(); loadPins(); loadUsage() }, [loadConversations, loadPins, loadUsage])
   useEffect(() => { loadMessages(conversationId) }, [conversationId, loadMessages])
 
-  async function sendMessage(text) {
-    if (!text.trim() || streaming) return
+  async function sendMessage(text, attachments) {
+    const atts = attachments || []
+    if ((!text.trim() && atts.length === 0) || streaming) return
 
     let activeId = conversationId
     // If no conversation, create one first
     if (!activeId) {
-      const conv = await apiPost('/conversations', { title: text.slice(0, 60) })
+      const titleSource = text.trim() || (atts[0]?.filename ?? 'New conversation')
+      const conv = await apiPost('/conversations', { title: titleSource.slice(0, 60) })
       activeId = conv.id
       await loadConversations()
       navigate(`/c/${activeId}`, { replace: true })
     }
 
-    const userMsg = { id: `tmp-u-${Date.now()}`, role: 'user', content: text, created_at: new Date().toISOString() }
+    const userMsg = {
+      id: `tmp-u-${Date.now()}`,
+      role: 'user',
+      content: text,
+      attachments: atts,
+      created_at: new Date().toISOString(),
+    }
     const assistantMsg = { id: `tmp-a-${Date.now()}`, role: 'assistant', content: '', created_at: new Date().toISOString(), streaming: true }
     setMessages((m) => [...m, userMsg, assistantMsg])
     setStreaming(true)
@@ -73,6 +81,7 @@ export default function ChatPage({ user, profile }) {
       await streamChat({
         conversationId: activeId,
         message: text,
+        attachmentIds: atts.map(a => a.id).filter(Boolean),
         onChunk: (chunk) => {
           streamBufferRef.current += chunk
           setMessages((m) => {

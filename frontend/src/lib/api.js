@@ -50,12 +50,61 @@ export async function apiDelete(path) {
  * Stream a chat response. Yields incremental text chunks via onChunk.
  * Returns the full assembled response with usage info on completion.
  */
-export async function streamChat({ conversationId, message, onChunk }) {
+// ---- Attachments ----
+
+/**
+ * Upload one file. Three steps: backend issues a V4 signed URL, browser PUTs
+ * the file directly to GCS, backend verifies + extracts text or transcribes
+ * video. Returns the final attachment record (with id, status, etc).
+ */
+export async function uploadAttachment(file, { onProgress } = {}) {
+  // 1. Init — backend issues a V4 signed PUT URL to GCS
+  const init = await apiPost('/attachments/init', {
+    filename: file.name,
+    content_type: file.type || 'application/octet-stream',
+    size: file.size,
+  })
+  // 2. PUT the file straight to GCS, bypassing Cloud Run's request-size cap
+  await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('PUT', init.upload_url)
+    for (const [k, v] of Object.entries(init.required_headers || {})) {
+      xhr.setRequestHeader(k, v)
+    }
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve()
+      else reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`))
+    }
+    xhr.onerror = () => reject(new Error('Network error during upload'))
+    xhr.send(file)
+  })
+  // 3. Tell the backend to verify and run extraction/transcription.
+  //    For video this blocks until Video Intelligence finishes (~30s+).
+  return apiPost(`/attachments/${init.id}/complete`)
+}
+
+export async function getAttachmentDownloadUrl(attId) {
+  const data = await apiGet(`/attachments/${attId}/download`)
+  return data.url
+}
+
+// ---- Chat ----
+
+export async function streamChat({ conversationId, message, attachmentIds, onChunk }) {
   const headers = await authHeaders()
   const res = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ conversation_id: conversationId, message }),
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      message,
+      attachment_ids: attachmentIds || [],
+    }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))

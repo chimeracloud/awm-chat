@@ -5,6 +5,7 @@ import { apiGet } from './lib/api'
 import LoginPage from './pages/LoginPage'
 import ChatPage from './pages/ChatPage'
 import AdminPage from './pages/AdminPage'
+import HelpPage from './pages/HelpPage'
 import PrivacyAck from './components/PrivacyAck'
 
 export default function App() {
@@ -59,6 +60,7 @@ export default function App() {
             : <Navigate to="/" replace />
         }
       />
+      <Route path="/help" element={<HelpPage profile={profile} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
