@@ -14,6 +14,7 @@ from .attachments import (
     load_attachments_full,
 )
 from .auth import AuthedUser, require_user
+from .awm_context import AWM_CONTEXT, AWM_GUIDANCE, web_tools
 from .config import get_settings
 from .storage import db, append_to_archive, get_global_settings, month_key, now
 
@@ -45,6 +46,8 @@ def _build_system_prompt(uid: str, profile: dict) -> str:
         f"an AWM staff member. Be precise, professional, and useful. When uncertain, say so plainly. "
         f"Do not fabricate regulatory or compliance specifics. Today is {now().strftime('%Y-%m-%d')}.\n\n"
     )
+    base += AWM_CONTEXT.strip() + "\n\n"
+    base += AWM_GUIDANCE.strip() + "\n\n"
     if pin_lines:
         base += "User pinned context (always consider):\n" + "\n".join(pin_lines) + "\n"
     return base
@@ -191,6 +194,7 @@ async def chat(
                 max_tokens=settings.MAX_OUTPUT_TOKENS,
                 system=system_prompt,
                 messages=history,
+                tools=web_tools(),
             ) as s:
                 for event in s:
                     if event.type == "content_block_delta" and event.delta.type == "text_delta":
