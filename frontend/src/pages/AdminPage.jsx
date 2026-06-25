@@ -48,6 +48,17 @@ export default function AdminPage({ user, profile }) {
     setEditingCap(null)
   }
 
+  async function resetUserUsage(uid, label) {
+    if (!confirm(`Clear this month’s consumption for ${label}?`)) return
+    try {
+      await apiPost(`/admin/users/${uid}/usage/reset`, {})
+      setUsers((us) => us.map((u) => (u.uid === uid ? { ...u, tokens_used: 0 } : u)))
+    } catch (e) {
+      console.error('Reset failed', e)
+      alert('Reset failed: ' + e.message)
+    }
+  }
+
   async function saveModel(uid, model) {
     setUsers((us) => us.map((u) => (u.uid === uid ? { ...u, model } : u)))
     try {
@@ -154,6 +165,13 @@ export default function AdminPage({ user, profile }) {
                             <div className="w-24 h-1.5 bg-ink-700 rounded-full overflow-hidden">
                               <div className={`h-full ${band}`} style={{ width: `${pct}%` }}/>
                             </div>
+                            <button
+                              onClick={() => resetUserUsage(u.uid, u.display_name || u.email)}
+                              className="text-[0.7rem] text-ink-300 hover:text-accent-danger transition-colors"
+                              title="Clear this month’s consumption for this user"
+                            >
+                              Reset
+                            </button>
                           </div>
                         </td>
                         <td className="px-4 py-3">

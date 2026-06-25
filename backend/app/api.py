@@ -258,6 +258,26 @@ async def admin_update_user(
     return {"ok": True}
 
 
+@router.post("/admin/users/{uid}/usage/reset")
+async def admin_reset_user_usage(
+    uid: str,
+    admin: Annotated[AuthedUser, Depends(require_admin)],
+):
+    """Clear this month's consumption counters for a single user."""
+    mkey = month_key()
+    ref = db().collection("usage").document(uid).collection("months").document(mkey)
+    ref.set({"tokens_used": 0, "input_tokens": 0, "output_tokens": 0, "requests": 0})
+    db().collection("audit").document().set({
+        "type": "usage_reset",
+        "admin_uid": admin.uid,
+        "admin_email": admin.email,
+        "target_uid": uid,
+        "month": mkey,
+        "created_at": now(),
+    })
+    return {"ok": True, "uid": uid, "month": mkey}
+
+
 @router.get("/admin/metrics")
 async def admin_metrics(admin: Annotated[AuthedUser, Depends(require_admin)]):
     mkey = month_key()
