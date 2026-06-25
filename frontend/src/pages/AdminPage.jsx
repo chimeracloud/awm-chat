@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, Users, Activity, AlertTriangle, Settings as SettingsIcon } from 'lucide-react'
-import { apiGet, apiPut } from '../lib/api'
+import { apiGet, apiPut, apiPost } from '../lib/api'
 import Logo from '../components/Logo'
 
 export default function AdminPage({ user, profile }) {
@@ -13,6 +13,25 @@ export default function AdminPage({ user, profile }) {
   const [settings, setSettings] = useState(null)
   const [editingCap, setEditingCap] = useState(null)
   const [capValue, setCapValue] = useState('')
+  const [resetting, setResetting] = useState(false)
+
+  async function resetUsage() {
+    if (!confirm('Clear this month’s consumption counters for ALL users? This cannot be undone.')) return
+    setResetting(true)
+    try {
+      const r = await apiPost('/admin/usage/reset', {})
+      const m = await apiGet('/admin/metrics')
+      setMetrics(m)
+      const u = await apiGet('/admin/users')
+      setUsers(u.items || [])
+      alert(`Cleared consumption for ${r.users_cleared} user(s).`)
+    } catch (e) {
+      console.error('Usage reset failed', e)
+      alert('Reset failed: ' + e.message)
+    } finally {
+      setResetting(false)
+    }
+  }
 
   useEffect(() => {
     apiGet('/admin/users').then((d) => setUsers(d.items || [])).catch(console.error)
@@ -166,11 +185,28 @@ export default function AdminPage({ user, profile }) {
         )}
 
         {tab === 'metrics' && metrics && (
-          <div className="max-w-6xl grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <Stat label="Active users" value={metrics.active_users || 0} sub="last 30 days"/>
-            <Stat label="Conversations" value={metrics.total_conversations || 0} sub="all time"/>
-            <Stat label="Tokens this month" value={`${((metrics.tokens_this_month || 0) / 1_000_000).toFixed(2)}M`} sub="across all users"/>
-            <Stat label="Estimated spend" value={`$${(metrics.estimated_spend_usd || 0).toFixed(2)}`} sub="this month"/>
+          <div className="max-w-6xl space-y-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <Stat label="Active users" value={metrics.active_users || 0} sub="last 30 days"/>
+              <Stat label="Conversations" value={metrics.total_conversations || 0} sub="all time"/>
+              <Stat label="Tokens this month" value={`${((metrics.tokens_this_month || 0) / 1_000_000).toFixed(2)}M`} sub="across all users"/>
+              <Stat label="Estimated spend" value={`$${(metrics.estimated_spend_usd || 0).toFixed(2)}`} sub="this month"/>
+            </div>
+            <div className="bg-ink-800/40 border border-ink-500/60 rounded-lg p-6 flex items-center justify-between">
+              <div>
+                <h3 className="font-display text-lg text-cream-50 tracking-tight">Reset consumption</h3>
+                <p className="text-sm text-cream-300 mt-1">
+                  Zero out this month’s token counters for every user. Caps stay unchanged.
+                </p>
+              </div>
+              <button
+                onClick={resetUsage}
+                disabled={resetting}
+                className="px-5 py-2 bg-accent-danger/90 text-cream-50 rounded text-sm font-medium hover:bg-accent-danger transition-colors disabled:opacity-50 whitespace-nowrap"
+              >
+                {resetting ? 'Clearing…' : 'Clear all usage'}
+              </button>
+            </div>
           </div>
         )}
 

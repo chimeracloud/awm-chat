@@ -282,6 +282,27 @@ async def admin_metrics(admin: Annotated[AuthedUser, Depends(require_admin)]):
     }
 
 
+@router.post("/admin/usage/reset")
+async def admin_reset_usage(admin: Annotated[AuthedUser, Depends(require_admin)]):
+    """Clear this month's consumption counters for every user."""
+    mkey = month_key()
+    cleared = 0
+    for u in db().collection("users").stream():
+        ref = db().collection("usage").document(u.id).collection("months").document(mkey)
+        if ref.get().exists:
+            ref.set({"tokens_used": 0, "input_tokens": 0, "output_tokens": 0, "requests": 0})
+            cleared += 1
+    db().collection("audit").document().set({
+        "type": "usage_reset",
+        "admin_uid": admin.uid,
+        "admin_email": admin.email,
+        "month": mkey,
+        "users_cleared": cleared,
+        "created_at": now(),
+    })
+    return {"ok": True, "users_cleared": cleared, "month": mkey}
+
+
 @router.get("/admin/flags")
 async def admin_flags(admin: Annotated[AuthedUser, Depends(require_admin)]):
     from google.cloud.firestore_v1 import Query
