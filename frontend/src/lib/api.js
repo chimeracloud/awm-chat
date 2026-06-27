@@ -127,17 +127,21 @@ export async function streamChat({ conversationId, message, attachmentIds, onChu
       if (!line.startsWith('data: ')) continue
       const data = line.slice(6).trim()
       if (!data) continue
+      // Only the JSON.parse may legitimately fail on a partial/malformed
+      // line — keep the try/catch scoped to it. A parsed `error` event is a
+      // real failure that must propagate, not be swallowed as "malformed".
+      let evt
       try {
-        const evt = JSON.parse(data)
-        if (evt.type === 'chunk' && onChunk) {
-          onChunk(evt.text)
-        } else if (evt.type === 'done') {
-          finalPayload = evt
-        } else if (evt.type === 'error') {
-          throw new Error(evt.message || 'Stream error')
-        }
-      } catch (e) {
-        // ignore malformed lines
+        evt = JSON.parse(data)
+      } catch {
+        continue // ignore malformed lines
+      }
+      if (evt.type === 'chunk' && onChunk) {
+        onChunk(evt.text)
+      } else if (evt.type === 'done') {
+        finalPayload = evt
+      } else if (evt.type === 'error') {
+        throw new Error(evt.message || 'Stream error')
       }
     }
   }
