@@ -97,6 +97,24 @@ def firestore_desc():
     return Query.DESCENDING
 
 
+def _resolve_model(profile: dict, global_cfg: dict, settings) -> str:
+    """Pick a usable Claude model ID.
+
+    A per-user override that isn't a real Claude model ID (e.g. a shorthand
+    like "4.6" typed into the admin panel) would 404 on every request for that
+    user. Fall back to the global default, then the built-in default, so a bad
+    value degrades gracefully instead of breaking the user's chat entirely.
+    """
+    for candidate in (
+        profile.get("model"),
+        global_cfg.get("default_model"),
+        settings.CLAUDE_MODEL,
+    ):
+        if isinstance(candidate, str) and candidate.startswith("claude-"):
+            return candidate
+    return settings.CLAUDE_MODEL
+
+
 @router.post("")
 async def chat(
     body: ChatRequest,
@@ -179,7 +197,7 @@ async def chat(
 
     history = _load_history(user.uid, body.conversation_id)
     system_prompt = _build_system_prompt(user.uid, profile)
-    model = profile.get("model") or global_cfg.get("default_model") or settings.CLAUDE_MODEL
+    model = _resolve_model(profile, global_cfg, settings)
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
