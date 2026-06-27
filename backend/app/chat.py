@@ -187,25 +187,48 @@ async def chat(
         assistant_text = ""
         input_tokens = 0
         output_tokens = 0
+        streamed_any = False
+        error_message = None
 
-        try:
-            with client.messages.stream(
+        def open_stream(use_tools: bool):
+            kwargs = dict(
                 model=model,
                 max_tokens=settings.MAX_OUTPUT_TOKENS,
                 system=system_prompt,
                 messages=history,
-                tools=web_tools(),
-            ) as s:
-                for event in s:
-                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                        delta = event.delta.text
-                        assistant_text += delta
-                        yield f"data: {json.dumps({'type': 'chunk', 'text': delta})}\n\n"
-                final = s.get_final_message()
-                input_tokens = final.usage.input_tokens
-                output_tokens = final.usage.output_tokens
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            )
+            if use_tools:
+                kwargs["tools"] = web_tools()
+            return client.messages.stream(**kwargs)
+
+        # Try with the server-side web tools first. If that fails *before* any
+        # output is produced (e.g. the user's assigned model can't use the web
+        # tools), retry once without them so the user still gets a reply rather
+        # than a dead, silently-looping turn.
+        for use_tools in (True, False):
+            try:
+                with open_stream(use_tools) as s:
+                    for event in s:
+                        if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                            delta = event.delta.text
+                            assistant_text += delta
+                            streamed_any = True
+                            yield f"data: {json.dumps({'type': 'chunk', 'text': delta})}\n\n"
+                    final = s.get_final_message()
+                    input_tokens = final.usage.input_tokens
+                    output_tokens = final.usage.output_tokens
+                error_message = None
+                break
+            except Exception as e:
+                if use_tools and not streamed_any:
+                    # Nothing was sent to the client yet — safe to retry cleanly.
+                    assistant_text = ""
+                    continue
+                error_message = str(e)
+                break
+
+        if error_message is not None:
+            yield f"data: {json.dumps({'type': 'error', 'message': error_message})}\n\n"
             return
 
         # Persist assistant message
