@@ -59,6 +59,31 @@ async def acknowledge(body: AckBody, user: Annotated[AuthedUser, Depends(require
     return ref.get().to_dict()
 
 
+# --- Self-service data export ----------------------------------------------
+
+
+@router.get("/export/me")
+async def export_me(user: Annotated[AuthedUser, Depends(require_user)]):
+    """Let a signed-in user download all of their own data as a zip."""
+    from fastapi.responses import Response
+    from .export import build_user_export_zip
+
+    zip_bytes, summary = build_user_export_zip(user.uid)
+    label = (user.email or "me").split("@")[0].replace(".", "_")
+    db().collection("audit").document().set({
+        "type": "self_export",
+        "uid": user.uid,
+        "email": user.email,
+        "summary": summary,
+        "created_at": now(),
+    })
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{label}_awm_chat_export.zip"'},
+    )
+
+
 # --- Conversations ---------------------------------------------------------
 
 
