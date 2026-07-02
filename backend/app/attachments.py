@@ -8,8 +8,8 @@ Flow:
 3. Frontend POSTs /attachments/{id}/complete. Backend verifies the object
    landed, extracts text (DOCX/TXT/CSV/MD) or transcribes (video) inline,
    and marks the attachment ready.
-4. Chat references the attachment by id; chat.py rebuilds the Anthropic
-   content blocks at send time and on every history load.
+4. Chat references the attachment by id; chat.py rebuilds the OpenAI
+   content parts at send time and on every history load.
 """
 import base64
 import io
@@ -164,42 +164,38 @@ def _transcribe_video(gcs_uri: str) -> str:
 
 # ---------------------- Content-block construction ----------------------
 
-def build_content_blocks(text: str, attachments_full: list[dict]) -> list[dict]:
-    """Build the Anthropic content-blocks list for one user message.
+def build_content_parts(text: str, attachments_full: list[dict]) -> list[dict]:
+    """Build the OpenAI Responses `input` content parts for one user message.
 
     `attachments_full` are full Firestore attachment records (with gcs_path,
     extracted_text, transcript). Image / PDF binaries are fetched from GCS
-    and base64-encoded inline. DOCX/TXT/CSV use stored extracted text.
-    Video uses the stored transcript only.
+    and base64-encoded into data URLs. DOCX/TXT/CSV use stored extracted
+    text. Video uses the stored transcript only.
     """
     bucket = archive_bucket()
-    blocks: list[dict] = []
+    parts: list[dict] = []
     for att in attachments_full:
         ct = att.get("content_type", "")
         filename = att.get("filename") or "attachment"
         if ct == "application/pdf":
             raw = bucket.blob(att["gcs_path"]).download_as_bytes()
-            blocks.append({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": base64.standard_b64encode(raw).decode("ascii"),
-                },
+            b64 = base64.standard_b64encode(raw).decode("ascii")
+            parts.append({
+                "type": "input_file",
+                "filename": filename,
+                "file_data": f"data:application/pdf;base64,{b64}",
             })
         elif ct.startswith("image/"):
             raw = bucket.blob(att["gcs_path"]).download_as_bytes()
-            blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": ct,
-                    "data": base64.standard_b64encode(raw).decode("ascii"),
-                },
+            b64 = base64.standard_b64encode(raw).decode("ascii")
+            parts.append({
+                "type": "input_image",
+                "image_url": f"data:{ct};base64,{b64}",
+                "detail": "auto",
             })
         elif att.get("extracted_text"):
-            blocks.append({
-                "type": "text",
+            parts.append({
+                "type": "input_text",
                 "text": (
                     f"[Attached document: {filename}]\n\n"
                     f"{att['extracted_text']}\n\n"
@@ -207,8 +203,8 @@ def build_content_blocks(text: str, attachments_full: list[dict]) -> list[dict]:
                 ),
             })
         elif att.get("transcript"):
-            blocks.append({
-                "type": "text",
+            parts.append({
+                "type": "input_text",
                 "text": (
                     f"[Attached video: {filename}. Audio transcript follows. "
                     f"This is a transcript only — no biometric or emotion inference.]\n\n"
@@ -217,8 +213,8 @@ def build_content_blocks(text: str, attachments_full: list[dict]) -> list[dict]:
                 ),
             })
     if text:
-        blocks.append({"type": "text", "text": text})
-    return blocks or [{"type": "text", "text": ""}]
+        parts.append({"type": "input_text", "text": text})
+    return parts or [{"type": "input_text", "text": ""}]
 
 
 def load_attachments_full(uid: str, attachment_ids: list[str]) -> list[dict]:

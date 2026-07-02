@@ -53,8 +53,8 @@ def get_global_settings() -> dict:
     """
     s = get_settings()
     defaults = {
-        "default_model": s.CLAUDE_MODEL,
-        "available_models": [s.CLAUDE_MODEL],
+        "default_model": s.DEFAULT_MODEL,
+        "available_models": [s.DEFAULT_MODEL],
         "default_cap_tokens": s.DEFAULT_CAP_TOKENS,
         "flag_keywords": list(s.FLAG_KEYWORDS),
     }

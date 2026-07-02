@@ -2,13 +2,13 @@
 import json
 from typing import Annotated
 
-import anthropic
+from openai import OpenAI
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .attachments import (
-    build_content_blocks,
+    build_content_parts,
     flag_scan_corpus,
     lightweight_attachment,
     load_attachments_full,
@@ -86,7 +86,7 @@ def _load_history(uid: str, conv_id: str) -> list[dict]:
         atts_full = load_attachments_full(uid, ids)
         history.append({
             "role": m["role"],
-            "content": build_content_blocks(text, atts_full),
+            "content": build_content_parts(text, atts_full),
         })
     return history
 
@@ -98,21 +98,26 @@ def firestore_desc():
 
 
 def _resolve_model(profile: dict, global_cfg: dict, settings) -> str:
-    """Pick a usable Claude model ID.
+    """Pick a usable OpenAI model ID.
 
-    A per-user override that isn't a real Claude model ID (e.g. a shorthand
-    like "4.6" typed into the admin panel) would 404 on every request for that
-    user. Fall back to the global default, then the built-in default, so a bad
-    value degrades gracefully instead of breaking the user's chat entirely.
+    Guards against two bad values reaching the OpenAI API: stale Claude-era
+    model IDs left in Firestore from before the provider switch, and shorthand
+    typos (e.g. "4.6") that aren't real model IDs. A per-user override is only
+    honoured if it is on the admin's `available_models` allowlist; otherwise we
+    fall back to the configured default, then the built-in default.
     """
-    for candidate in (
-        profile.get("model"),
-        global_cfg.get("default_model"),
-        settings.CLAUDE_MODEL,
-    ):
-        if isinstance(candidate, str) and candidate.startswith("claude-"):
-            return candidate
-    return settings.CLAUDE_MODEL
+    def usable(m) -> bool:
+        return isinstance(m, str) and bool(m) and not m.startswith("claude")
+
+    default = global_cfg.get("default_model")
+    if not usable(default):
+        default = settings.DEFAULT_MODEL
+
+    allowed = [m for m in (global_cfg.get("available_models") or []) if usable(m)]
+    candidate = profile.get("model")
+    if usable(candidate) and (candidate in allowed or not allowed):
+        return candidate
+    return default
 
 
 @router.post("")
@@ -199,7 +204,7 @@ async def chat(
     system_prompt = _build_system_prompt(user.uid, profile)
     model = _resolve_model(profile, global_cfg, settings)
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = OpenAI(api_key=settings.openai_api_key)
 
     async def stream():
         assistant_text = ""
@@ -211,30 +216,36 @@ async def chat(
         def open_stream(use_tools: bool):
             kwargs = dict(
                 model=model,
-                max_tokens=settings.MAX_OUTPUT_TOKENS,
-                system=system_prompt,
-                messages=history,
+                instructions=system_prompt,
+                input=history,
+                max_output_tokens=settings.MAX_OUTPUT_TOKENS,
+                stream=True,
             )
             if use_tools:
                 kwargs["tools"] = web_tools()
-            return client.messages.stream(**kwargs)
+            return client.responses.create(**kwargs)
 
-        # Try with the server-side web tools first. If that fails *before* any
-        # output is produced (e.g. the user's assigned model can't use the web
-        # tools), retry once without them so the user still gets a reply rather
-        # than a dead, silently-looping turn.
+        # Try with the server-side web search tool first. If that fails *before*
+        # any output is produced, retry once without it so the user still gets a
+        # reply rather than a dead, silently-looping turn.
         for use_tools in (True, False):
             try:
-                with open_stream(use_tools) as s:
-                    for event in s:
-                        if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                            delta = event.delta.text
-                            assistant_text += delta
-                            streamed_any = True
-                            yield f"data: {json.dumps({'type': 'chunk', 'text': delta})}\n\n"
-                    final = s.get_final_message()
-                    input_tokens = final.usage.input_tokens
-                    output_tokens = final.usage.output_tokens
+                for event in open_stream(use_tools):
+                    etype = getattr(event, "type", "")
+                    if etype == "response.output_text.delta":
+                        delta = event.delta
+                        assistant_text += delta
+                        streamed_any = True
+                        yield f"data: {json.dumps({'type': 'chunk', 'text': delta})}\n\n"
+                    elif etype == "response.completed":
+                        usage = getattr(event.response, "usage", None)
+                        if usage is not None:
+                            input_tokens = usage.input_tokens
+                            output_tokens = usage.output_tokens
+                    elif etype in ("response.failed", "error"):
+                        resp = getattr(event, "response", None)
+                        err = getattr(resp, "error", None) or getattr(event, "message", None)
+                        raise RuntimeError(getattr(err, "message", None) or str(err) or "response failed")
                 error_message = None
                 break
             except Exception as e:
