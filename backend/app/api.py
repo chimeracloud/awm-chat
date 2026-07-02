@@ -258,6 +258,39 @@ async def admin_update_user(
     return {"ok": True}
 
 
+@router.get("/admin/users/{uid}/export")
+async def admin_export_user(
+    uid: str,
+    admin: Annotated[AuthedUser, Depends(require_admin)],
+):
+    """Download one user's full data (conversations, pins, attachments) as a zip."""
+    from fastapi.responses import Response
+    from .export import build_user_export_zip
+
+    snap = db().collection("users").document(uid).get()
+    if not snap.exists:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+
+    zip_bytes, summary = build_user_export_zip(uid)
+    email = (snap.to_dict() or {}).get("email") or uid
+    label = email.split("@")[0].replace(".", "_")
+
+    db().collection("audit").document().set({
+        "type": "user_export",
+        "admin_uid": admin.uid,
+        "admin_email": admin.email,
+        "target_uid": uid,
+        "summary": summary,
+        "created_at": now(),
+    })
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{label}_awm_chat_export.zip"'},
+    )
+
+
 @router.post("/admin/users/{uid}/usage/reset")
 async def admin_reset_user_usage(
     uid: str,
