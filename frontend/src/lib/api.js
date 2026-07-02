@@ -46,6 +46,27 @@ export async function apiDelete(path) {
   return res.ok
 }
 
+/** GET an authenticated endpoint that returns a file, and trigger a browser download. */
+export async function apiDownload(path, fallbackName = 'download') {
+  const headers = await authHeaders()
+  const res = await fetch(`${API_BASE}${path}`, { headers })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Download failed: ${res.status}`)
+  }
+  const match = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '')
+  const filename = match ? match[1] : fallbackName
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
 /**
  * Stream a chat response. Yields incremental text chunks via onChunk.
  * Returns the full assembled response with usage info on completion.

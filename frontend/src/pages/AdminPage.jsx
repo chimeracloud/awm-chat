@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, Users, Activity, AlertTriangle, Settings as SettingsIcon } from 'lucide-react'
-import { apiGet, apiPut, apiPost } from '../lib/api'
+import { apiGet, apiPut, apiPost, apiDownload } from '../lib/api'
 import Logo from '../components/Logo'
 
 export default function AdminPage({ user, profile }) {
@@ -14,6 +14,19 @@ export default function AdminPage({ user, profile }) {
   const [editingCap, setEditingCap] = useState(null)
   const [capValue, setCapValue] = useState('')
   const [resetting, setResetting] = useState(false)
+  const [exporting, setExporting] = useState(null)
+
+  async function exportUser(uid, label) {
+    setExporting(uid)
+    try {
+      await apiDownload(`/admin/users/${uid}/export`, `${label}_awm_chat_export.zip`)
+    } catch (e) {
+      console.error('Export failed', e)
+      alert('Export failed: ' + e.message)
+    } finally {
+      setExporting(null)
+    }
+  }
 
   async function resetUsage() {
     if (!confirm('Clear this month’s consumption counters for ALL users? This cannot be undone.')) return
@@ -122,6 +135,7 @@ export default function AdminPage({ user, profile }) {
                     <th className="px-4 py-3 font-medium">Tokens this month</th>
                     <th className="px-4 py-3 font-medium">Cap</th>
                     <th className="px-4 py-3 font-medium">Conversations</th>
+                    <th className="px-4 py-3 font-medium">Data</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -193,6 +207,16 @@ export default function AdminPage({ user, profile }) {
                           )}
                         </td>
                         <td className="px-4 py-3 text-cream-200 font-mono text-xs">{u.conversation_count || 0}</td>
+                        <td className="px-4 py-3">
+                          <button
+                            onClick={() => exportUser(u.uid, (u.email || 'user').split('@')[0].replace(/\./g, '_'))}
+                            disabled={exporting === u.uid}
+                            className="text-xs px-2.5 py-1 rounded border border-ink-500 text-cream-200 hover:border-gold-500/40 hover:text-cream-50 transition-colors disabled:opacity-50"
+                            title="Download this user’s chats, pins and attachments as a zip"
+                          >
+                            {exporting === u.uid ? 'Exporting…' : 'Export'}
+                          </button>
+                        </td>
                       </tr>
                     )
                   })}
