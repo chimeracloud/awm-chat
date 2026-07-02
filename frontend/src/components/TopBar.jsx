@@ -1,9 +1,25 @@
-import { Pin, LogOut, Settings, HelpCircle } from 'lucide-react'
+import { Pin, LogOut, Settings, HelpCircle, Download } from 'lucide-react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { signOut } from '../lib/firebase'
+import { apiDownload } from '../lib/api'
 
 export default function TopBar({ user, profile, usage, onTogglePins, pinsActive }) {
   const navigate = useNavigate()
+  const [exporting, setExporting] = useState(false)
+
+  async function exportMyData() {
+    if (exporting) return
+    setExporting(true)
+    try {
+      await apiDownload('/export/me', 'my_awm_chat_export.zip')
+    } catch (e) {
+      console.error('Export failed', e)
+      alert('Export failed: ' + e.message)
+    } finally {
+      setExporting(false)
+    }
+  }
   const pct = usage && usage.cap_tokens ? Math.min(100, (usage.tokens_used / usage.cap_tokens) * 100) : 0
   const pctBand = pct < 60 ? 'bg-accent-success' : pct < 85 ? 'bg-gold-500' : 'bg-accent-danger'
 
@@ -38,6 +54,15 @@ export default function TopBar({ user, profile, usage, onTogglePins, pinsActive 
         >
           <Pin size={13} />
           Pinned context
+        </button>
+
+        <button
+          onClick={exportMyData}
+          disabled={exporting}
+          className="text-ink-300 hover:text-cream-100 transition-colors disabled:opacity-50"
+          title="Download my data (chats, pinned context and attachments)"
+        >
+          <Download size={16} className={exporting ? 'animate-pulse' : ''} />
         </button>
 
         <button
