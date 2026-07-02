@@ -8,10 +8,9 @@ This module supplies three things to chat.py:
   fetch the site each turn.
 - ``AWM_GUIDANCE`` — short instructions on when to draw on the static
   context vs. reach for the web tools.
-- ``web_tools()`` — the Anthropic server-side web_search + web_fetch
-  tool specifications. Adding these to ``messages.stream(...)`` gives
-  Claude live internet access during a turn (search the web, fetch a
-  specific URL).
+- ``web_tools()`` — the OpenAI server-side web_search tool
+  specification. Adding it to ``responses.create(...)`` gives the model
+  live internet access during a turn.
 
 ascotwm.com is a JavaScript-rendered single-page application, so
 Anthropic's ``web_fetch`` will not retrieve useful content from its
@@ -215,19 +214,15 @@ about AWM itself — its services, philosophy, team, locations, fees,
 process and tone. Mirror AWM's plain-English, no-jargon,
 transparent-fee style.
 
-You also have access to two server-side web tools:
+You also have access to a server-side web search tool:
 
-- ``web_search`` — searches the live web. Use it for current market
-  information, news, regulatory or tax updates, comparison facts, or
-  general internet research that isn't AWM-specific.
-- ``web_fetch`` — retrieves the full content of a specific URL. Use it
-  when the user (or a search result) points to a page worth reading in
-  detail. Note: ascotwm.com is a JavaScript-rendered single-page
-  application, so ``web_fetch`` will not get useful content from its
-  sub-pages. For AWM-specific questions rely on the firm reference
-  above and link the user to the relevant ascotwm.com page.
+- ``web_search`` — searches the live web and reads the resulting
+  pages. Use it for current market information, news, regulatory or
+  tax updates, comparison facts, or general internet research that
+  isn't AWM-specific. For AWM-specific questions rely on the firm
+  reference above and link the user to the relevant ascotwm.com page.
 
-When using web tools:
+When using web search:
 
 - Cite the source URL when stating a fact that came from the web.
 - Verify regulatory, tax or compliance claims against an authoritative
@@ -242,33 +237,11 @@ source.
 
 
 def web_tools() -> list[dict]:
-    """Anthropic server-side web tools: search + fetch.
+    """OpenAI server-side web search tool for the Responses API.
 
-    Uses the stable, widely-supported versions:
-
-    - ``web_search_20250305`` — works with any tool-use-capable model,
-      no code-execution dependency. $10 per 1,000 searches plus the
-      standard token cost for any content brought into context.
-    - ``web_fetch_20250910`` — no per-call charge beyond token cost.
-      For security, Claude can only fetch URLs that came from the
-      user, from previous web_search results, or from previous
-      web_fetch results.
-
-    Newer ``_20260209`` variants of both tools support dynamic
-    filtering but require the code-execution tool to be enabled.
-    Switch to those if/when we add code execution.
+    ``{"type": "web_search"}`` is the current built-in web search tool.
+    The model decides when to search; results (with source URLs) are
+    folded into the response server-side, so there is no client-side
+    tool-execution loop to manage.
     """
-    return [
-        {
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5,
-        },
-        {
-            "type": "web_fetch_20250910",
-            "name": "web_fetch",
-            "max_uses": 5,
-            "max_content_tokens": 20000,
-            "citations": {"enabled": True},
-        },
-    ]
+    return [{"type": "web_search"}]
