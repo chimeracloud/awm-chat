@@ -26,7 +26,7 @@ class Settings:
     GCS_ARCHIVE_BUCKET: str = os.getenv("GCS_ARCHIVE_BUCKET", "awm-chat-archive")
     ALLOWED_EMAIL_DOMAIN: str = os.getenv("ALLOWED_EMAIL_DOMAIN", "ascotwm.com")
     DEFAULT_CAP_TOKENS: int = int(os.getenv("DEFAULT_CAP_TOKENS", "500000"))
-    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-4o")
     MAX_OUTPUT_TOKENS: int = int(os.getenv("MAX_OUTPUT_TOKENS", "4096"))
     CONTEXT_WINDOW_MESSAGES: int = int(os.getenv("CONTEXT_WINDOW_MESSAGES", "40"))
     CORS_ORIGINS: list[str] = os.getenv(
@@ -42,8 +42,8 @@ class Settings:
     ]
 
     @property
-    def anthropic_api_key(self) -> str:
-        return _get_secret("ANTHROPIC_API_KEY")
+    def openai_api_key(self) -> str:
+        return _get_secret("OPENAI_API_KEY")
 
 
 @lru_cache
