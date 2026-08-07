@@ -9,6 +9,8 @@ google-cloud-storage==2.19.0
 google-cloud-secret-manager==2.21.1
 google-cloud-videointelligence==2.16.0
 firebase-admin==6.6.0
-pydantic==2.10.4
+# google-genai requires pydantic>=2.12.5; pinning below that makes the image
+# build unresolvable. Bump these together.
+pydantic==2.13.4
 python-multipart==0.0.20
 python-docx==1.1.2
