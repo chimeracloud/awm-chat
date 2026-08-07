@@ -5,8 +5,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from .auth import AuthedUser, require_user, require_admin
-from .config import get_settings
-from .storage import db, get_global_settings, month_key, now
+from .config import available_providers, get_settings
+from .credits import all_provider_spend, invalidate_spend_cache
+from .providers.registry import MODEL_CATALOG, PROVIDER_LABELS, PROVIDERS, model_info
+from .storage import (
+    cap_for,
+    db,
+    get_global_settings,
+    month_key,
+    now,
+    read_usage,
+    reset_usage,
+)
 
 router = APIRouter()
 
@@ -153,6 +163,10 @@ async def list_messages(conv_id: str, user: Annotated[AuthedUser, Depends(requir
             "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
             "input_tokens": d.get("input_tokens"),
             "output_tokens": d.get("output_tokens"),
+            # Absent on messages written before multi-agent support; the UI
+            # simply omits the byline for those.
+            "model": d.get("model"),
+            "provider": d.get("provider"),
         })
     return {"items": items}
 
@@ -213,14 +227,102 @@ async def delete_pin(pin_id: str, user: Annotated[AuthedUser, Depends(require_us
 
 @router.get("/usage/me")
 async def my_usage(user: Annotated[AuthedUser, Depends(require_user)]):
+    """Aggregate usage. Kept for backwards compatibility with older clients —
+    `/agents` is what the multi-agent UI reads."""
     profile = db().collection("users").document(user.uid).get().to_dict() or {}
-    snap = db().collection("usage").document(user.uid).collection("months").document(month_key()).get()
-    used = (snap.to_dict() or {}).get("tokens_used", 0) if snap.exists else 0
+    usage = read_usage(user.uid)
     return {
         "month": month_key(),
-        "tokens_used": used,
+        "tokens_used": usage["tokens_used"],
         "cap_tokens": profile.get("cap_tokens", get_settings().DEFAULT_CAP_TOKENS),
     }
+
+
+# --- Agents (model switcher + battery indicators) ---------------------------
+
+
+@router.get("/agents")
+async def list_agents(user: Annotated[AuthedUser, Depends(require_user)]):
+    """Everything the chat window needs to render the switcher and batteries.
+
+    Two layers per agent, because no vendor publishes a remaining-credit
+    balance (verified for Anthropic, OpenAI and Google — see `credits.py`):
+
+    * `allowance` — this user's own monthly token pool for that agent. Exact,
+      live, and the thing that actually gates them. This drives the battery.
+    * `org_spend` — month-to-date spend from the vendor's cost API against a
+      budget set in config. Best-effort and org-wide; absent when no admin key
+      or budget is configured, in which case the UI omits the marker.
+    """
+    profile = db().collection("users").document(user.uid).get().to_dict() or {}
+    cfg = get_global_settings()
+    usage = read_usage(user.uid)
+    spend = all_provider_spend()
+    usable = set(available_providers())
+
+    allowed = [m for m in (cfg.get("available_models") or []) if model_info(m)]
+    if not allowed:
+        allowed = list(MODEL_CATALOG)
+
+    agents = []
+    for provider in PROVIDERS:
+        models = [
+            {
+                "id": m,
+                "label": MODEL_CATALOG[m]["label"],
+                "blurb": MODEL_CATALOG[m].get("blurb", ""),
+            }
+            for m in allowed
+            if MODEL_CATALOG[m]["provider"] == provider
+        ]
+        if not models:
+            continue
+
+        cap = cap_for(profile, provider)
+        used = usage["by_provider"][provider]["tokens_used"]
+        configured = provider in usable
+
+        agents.append({
+            "provider": provider,
+            "label": PROVIDER_LABELS[provider],
+            "available": configured,
+            "unavailable_reason": None if configured else "No API key configured",
+            "models": models,
+            "allowance": {
+                "tokens_used": used,
+                "cap_tokens": cap,
+                "tokens_remaining": max(0, cap - used) if cap else None,
+                "fraction_used": min(1.0, used / cap) if cap else None,
+                "exhausted": bool(cap and used >= cap),
+            },
+            "org_spend": spend.get(provider, {"available": False}),
+        })
+
+    return {
+        "month": month_key(),
+        "agents": agents,
+        "selected_model": profile.get("model") or cfg.get("default_model"),
+    }
+
+
+class ModelPreference(BaseModel):
+    model: str
+
+
+@router.put("/me/model")
+async def set_my_model(
+    body: ModelPreference,
+    user: Annotated[AuthedUser, Depends(require_user)],
+):
+    """Remember the agent picked in the chat window as this user's default."""
+    if not model_info(body.model):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown model: {body.model}")
+    cfg = get_global_settings()
+    allowed = cfg.get("available_models") or []
+    if allowed and body.model not in allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "That agent is not enabled for your organisation")
+    db().collection("users").document(user.uid).update({"model": body.model})
+    return {"ok": True, "model": body.model}
 
 
 # --- Admin -----------------------------------------------------------------
@@ -231,10 +333,7 @@ async def admin_list_users(admin: Annotated[AuthedUser, Depends(require_admin)])
     items = []
     for u in db().collection("users").stream():
         d = u.to_dict()
-        usage_snap = (
-            db().collection("usage").document(u.id).collection("months").document(month_key()).get()
-        )
-        used = (usage_snap.to_dict() or {}).get("tokens_used", 0) if usage_snap.exists else 0
+        usage = read_usage(u.id)
         # Count conversations
         conv_count = 0
         for _ in db().collection("conversations").where("owner_uid", "==", u.id).where("archived", "==", False).stream():
@@ -246,7 +345,11 @@ async def admin_list_users(admin: Annotated[AuthedUser, Depends(require_admin)])
             "role": d.get("role", "user"),
             "model": d.get("model"),
             "cap_tokens": d.get("cap_tokens", get_settings().DEFAULT_CAP_TOKENS),
-            "tokens_used": used,
+            "caps_by_provider": {p: cap_for(d, p) for p in PROVIDERS},
+            "tokens_used": usage["tokens_used"],
+            "tokens_by_provider": {
+                p: usage["by_provider"][p]["tokens_used"] for p in PROVIDERS
+            },
             "conversation_count": conv_count,
         })
     items.sort(key=lambda x: x["tokens_used"], reverse=True)
@@ -257,6 +360,9 @@ class UserUpdate(BaseModel):
     cap_tokens: int | None = None
     role: str | None = None
     model: str | None = None
+    # Per-agent allowances, e.g. {"anthropic": 500000, "openai": 250000}.
+    # Any agent left out falls back to `cap_tokens`.
+    caps_by_provider: dict[str, int] | None = None
 
 
 @router.put("/admin/users/{uid}")
@@ -268,7 +374,17 @@ async def admin_update_user(
     patch = {}
     if body.cap_tokens is not None: patch["cap_tokens"] = body.cap_tokens
     if body.role is not None: patch["role"] = body.role
-    if body.model is not None: patch["model"] = body.model
+    if body.model is not None:
+        if not model_info(body.model):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown model: {body.model}")
+        patch["model"] = body.model
+    if body.caps_by_provider is not None:
+        unknown = set(body.caps_by_provider) - set(PROVIDERS)
+        if unknown:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, f"Unknown provider(s): {', '.join(sorted(unknown))}"
+            )
+        patch["caps_by_provider"] = body.caps_by_provider
     if not patch:
         return {"ok": True}
     db().collection("users").document(uid).update(patch)
@@ -321,10 +437,9 @@ async def admin_reset_user_usage(
     uid: str,
     admin: Annotated[AuthedUser, Depends(require_admin)],
 ):
-    """Clear this month's consumption counters for a single user."""
+    """Clear this month's consumption counters for a single user, all agents."""
     mkey = month_key()
-    ref = db().collection("usage").document(uid).collection("months").document(mkey)
-    ref.set({"tokens_used": 0, "input_tokens": 0, "output_tokens": 0, "requests": 0})
+    reset_usage(uid, mkey)
     db().collection("audit").document().set({
         "type": "usage_reset",
         "admin_uid": admin.uid,
@@ -341,22 +456,54 @@ async def admin_metrics(admin: Annotated[AuthedUser, Depends(require_admin)]):
     mkey = month_key()
     total_tokens = 0
     active_users = 0
+    tokens_by_provider = {p: 0 for p in PROVIDERS}
     for u in db().collection("users").stream():
-        snap = db().collection("usage").document(u.id).collection("months").document(mkey).get()
-        if snap.exists:
-            used = snap.to_dict().get("tokens_used", 0)
-            total_tokens += used
-            if used > 0:
-                active_users += 1
+        usage = read_usage(u.id, mkey)
+        used = usage["tokens_used"]
+        total_tokens += used
+        for p in PROVIDERS:
+            tokens_by_provider[p] += usage["by_provider"][p]["tokens_used"]
+        if used > 0:
+            active_users += 1
     total_conversations = sum(1 for _ in db().collection("conversations").stream())
-    # Sonnet rough pricing for estimation: $3/M input, $15/M output ... split assumption 1:3
-    estimated_spend = (total_tokens / 4) / 1_000_000 * 3 + (3 * total_tokens / 4) / 1_000_000 * 15
+
+    # Actual billed spend from each vendor's cost API, where configured. This
+    # replaces the old single-model token estimate, which was meaningless once
+    # three vendors with different rates were in play.
+    spend = all_provider_spend()
+    billed = [s["spend_usd"] for s in spend.values() if s.get("available")]
+
     return {
         "month": mkey,
         "tokens_this_month": total_tokens,
+        "tokens_by_provider": tokens_by_provider,
         "active_users": active_users,
         "total_conversations": total_conversations,
-        "estimated_spend_usd": estimated_spend,
+        "provider_spend": spend,
+        "billed_spend_usd": round(sum(billed), 2) if billed else None,
+    }
+
+
+@router.get("/admin/providers")
+async def admin_providers(admin: Annotated[AuthedUser, Depends(require_admin)]):
+    """Which agents are configured, and what each vendor's cost API reports.
+
+    `org_spend.available: false` is expected and harmless — it means no admin
+    key or budget is set for that vendor, and the UI just hides the marker.
+    """
+    usable = set(available_providers())
+    spend = all_provider_spend()
+    return {
+        "providers": [
+            {
+                "provider": p,
+                "label": PROVIDER_LABELS[p],
+                "key_configured": p in usable,
+                "models": [m for m, i in MODEL_CATALOG.items() if i["provider"] == p],
+                "org_spend": spend.get(p, {"available": False}),
+            }
+            for p in PROVIDERS
+        ]
     }
 
 
@@ -368,7 +515,7 @@ async def admin_reset_usage(admin: Annotated[AuthedUser, Depends(require_admin)]
     for u in db().collection("users").stream():
         ref = db().collection("usage").document(u.id).collection("months").document(mkey)
         if ref.get().exists:
-            ref.set({"tokens_used": 0, "input_tokens": 0, "output_tokens": 0, "requests": 0})
+            reset_usage(u.id, mkey)
             cleared += 1
     db().collection("audit").document().set({
         "type": "usage_reset",
@@ -413,6 +560,10 @@ class SettingsUpdate(BaseModel):
     available_models: list[str] | None = None
     default_cap_tokens: int | None = None
     flag_keywords: list[str] | None = None
+    # Non-secret agent config, editable in the admin Settings page. API keys are
+    # deliberately not here — those go to Secret Manager via /admin/secrets.
+    provider_budgets_usd: dict[str, float] | None = None
+    gcp_billing_export_table: str | None = None
 
 
 @router.get("/admin/settings")
@@ -426,8 +577,27 @@ async def admin_update_settings(
     admin: Annotated[AuthedUser, Depends(require_admin)],
 ):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
+
+    if "provider_budgets_usd" in patch:
+        unknown = set(patch["provider_budgets_usd"]) - set(PROVIDERS)
+        if unknown:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Unknown provider(s): {', '.join(sorted(unknown))}",
+            )
+    if "available_models" in patch:
+        bad = [m for m in patch["available_models"] if not model_info(m)]
+        if bad:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, f"Unknown model(s): {', '.join(bad)}"
+            )
+
     if patch:
         db().collection("settings").document("global").set(patch, merge=True)
+        # Budgets feed the cached spend markers — drop the cache so a changed
+        # budget is reflected immediately rather than up to 5 minutes later.
+        if "provider_budgets_usd" in patch or "gcp_billing_export_table" in patch:
+            invalidate_spend_cache()
         db().collection("audit").document().set({
             "type": "settings_update",
             "admin_uid": admin.uid,

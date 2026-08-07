@@ -6,6 +6,7 @@ from .config import get_settings
 from .api import router as api_router
 from .chat import router as chat_router
 from .attachments import router as attachments_router
+from .secrets_admin import router as secrets_router
 
 settings = get_settings()
 
@@ -26,6 +27,7 @@ async def health():
 
 
 app.include_router(api_router)
+app.include_router(secrets_router)
 app.include_router(chat_router, prefix="/chat")
 app.include_router(attachments_router, prefix="/attachments")
 

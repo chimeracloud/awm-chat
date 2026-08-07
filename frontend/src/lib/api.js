@@ -28,6 +28,22 @@ export async function apiPost(path, body) {
   return res.json()
 }
 
+/**
+ * Raised when the active agent's monthly allowance is spent.
+ * `alternatives` lists agents that still have tokens, so the UI can offer a
+ * switch instead of a dead end.
+ */
+export class AgentCapReachedError extends Error {
+  constructor(detail) {
+    super(detail?.message || 'Monthly token allowance reached for this agent.')
+    this.name = 'AgentCapReachedError'
+    this.provider = detail?.provider
+    this.providerLabel = detail?.provider_label
+    this.model = detail?.model
+    this.alternatives = detail?.alternatives || []
+  }
+}
+
 export async function apiPut(path, body) {
   const headers = await authHeaders()
   const res = await fetch(`${API_BASE}${path}`, {
@@ -116,7 +132,7 @@ export async function getAttachmentDownloadUrl(attId) {
 
 // ---- Chat ----
 
-export async function streamChat({ conversationId, message, attachmentIds, onChunk }) {
+export async function streamChat({ conversationId, message, attachmentIds, model, onChunk, onMeta }) {
   const headers = await authHeaders()
   const res = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
@@ -125,11 +141,20 @@ export async function streamChat({ conversationId, message, attachmentIds, onChu
       conversation_id: conversationId,
       message,
       attachment_ids: attachmentIds || [],
+      model: model || null,
     }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || `Chat failed: ${res.status}`)
+    // A spent allowance is a structured payload, not a plain string — it
+    // carries the agents the user could switch to.
+    if (res.status === 429 && err.detail?.error === 'provider_cap_reached') {
+      throw new AgentCapReachedError(err.detail)
+    }
+    const detail = err.detail
+    throw new Error(
+      (typeof detail === 'string' ? detail : detail?.message) || `Chat failed: ${res.status}`
+    )
   }
 
   const reader = res.body.getReader()
@@ -159,6 +184,9 @@ export async function streamChat({ conversationId, message, attachmentIds, onChu
       }
       if (evt.type === 'chunk' && onChunk) {
         onChunk(evt.text)
+      } else if (evt.type === 'meta' && onMeta) {
+        // Which agent actually answered — the user may switch mid-stream.
+        onMeta(evt)
       } else if (evt.type === 'done') {
         finalPayload = evt
       } else if (evt.type === 'error') {

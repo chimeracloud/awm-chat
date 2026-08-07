@@ -1,8 +1,13 @@
-"""Chat: streams from Anthropic, persists to Firestore + GCS, updates usage."""
+"""Chat: dispatches to the selected agent, persists to Firestore + GCS, updates usage.
+
+Three vendors are reachable from here (Claude, OpenAI, Gemini) but only one
+storage format exists. Everything written to Firestore and the GCS archive is
+in the canonical shape this app has always used; the chosen provider adapter
+translates it on the way out. See `providers/__init__.py` for the format.
+"""
 import json
 from typing import Annotated
 
-from openai import OpenAI
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -14,9 +19,26 @@ from .attachments import (
     load_attachments_full,
 )
 from .auth import AuthedUser, require_user
-from .awm_context import AWM_CONTEXT, AWM_GUIDANCE, web_tools
-from .config import get_settings
-from .storage import db, append_to_archive, get_global_settings, month_key, now
+from .awm_context import AWM_CONTEXT, AWM_GUIDANCE
+from .config import available_providers, get_settings
+from .providers.base import ChatRequestSpec, StreamChunk, StreamDone, StreamError
+from .providers.registry import (
+    PROVIDER_LABELS,
+    default_model_for,
+    get_provider,
+    model_info,
+    provider_for_model,
+)
+from .storage import (
+    append_to_archive,
+    cap_for,
+    db,
+    get_global_settings,
+    month_key,
+    now,
+    read_usage,
+    record_usage,
+)
 
 router = APIRouter()
 
@@ -25,6 +47,9 @@ class ChatRequest(BaseModel):
     conversation_id: str
     message: str
     attachment_ids: list[str] | None = None
+    # Per-turn agent override from the in-chat switcher. Falls back to the
+    # user's saved preference when absent, so older clients keep working.
+    model: str | None = None
 
 
 def _scan_for_flags(text: str, keywords: list[str]) -> list[str]:
@@ -53,8 +78,19 @@ def _build_system_prompt(uid: str, profile: dict) -> str:
     return base
 
 
+def firestore_desc():
+    # Helper for import-friendly direction enum
+    from google.cloud.firestore_v1 import Query
+    return Query.DESCENDING
+
+
 def _load_history(uid: str, conv_id: str) -> list[dict]:
-    """Load recent messages in chronological order for the API call."""
+    """Load recent messages in chronological order, in the canonical format.
+
+    This is provider-agnostic on purpose — the same list is handed to whichever
+    adapter is serving the turn, which is what lets a conversation continue
+    across agents.
+    """
     settings = get_settings()
     msgs_ref = (
         db()
@@ -91,33 +127,78 @@ def _load_history(uid: str, conv_id: str) -> list[dict]:
     return history
 
 
-def firestore_desc():
-    # Helper for import-friendly direction enum
-    from google.cloud.firestore_v1 import Query
-    return Query.DESCENDING
+def _resolve_model(requested: str | None, profile: dict, global_cfg: dict, settings) -> str:
+    """Pick a model we can actually serve.
 
-
-def _resolve_model(profile: dict, global_cfg: dict, settings) -> str:
-    """Pick a usable OpenAI model ID.
-
-    Guards against two bad values reaching the OpenAI API: stale Claude-era
-    model IDs left in Firestore from before the provider switch, and shorthand
-    typos (e.g. "4.6") that aren't real model IDs. A per-user override is only
-    honoured if it is on the admin's `available_models` allowlist; otherwise we
-    fall back to the configured default, then the built-in default.
+    Order of preference: the model chosen in the chat window, then the user's
+    saved default, then the org default, then the built-in default. A candidate
+    is only honoured if it is in the catalog, on the admin's allowlist, and
+    backed by a configured API key — otherwise a stale or unlicensed choice
+    would 500 mid-stream instead of falling back.
     """
-    def usable(m) -> bool:
-        return isinstance(m, str) and bool(m) and not m.startswith("claude")
+    allowed = [m for m in (global_cfg.get("available_models") or []) if model_info(m)]
+    usable_providers = set(available_providers())
 
-    default = global_cfg.get("default_model")
-    if not usable(default):
-        default = settings.DEFAULT_MODEL
+    def ok(candidate) -> bool:
+        if not isinstance(candidate, str) or not candidate:
+            return False
+        info = model_info(candidate)
+        if not info or info["provider"] not in usable_providers:
+            return False
+        return candidate in allowed if allowed else True
 
-    allowed = [m for m in (global_cfg.get("available_models") or []) if usable(m)]
-    candidate = profile.get("model")
-    if usable(candidate) and (candidate in allowed or not allowed):
-        return candidate
-    return default
+    for candidate in (requested, profile.get("model"), global_cfg.get("default_model"),
+                      settings.DEFAULT_MODEL):
+        if ok(candidate):
+            return candidate
+
+    # Nothing configured is usable — fall back to any catalog model whose
+    # vendor has a key, so the app degrades to "works" rather than "broken".
+    for candidate in allowed:
+        if ok(candidate):
+            return candidate
+    for provider in usable_providers:
+        fallback = default_model_for(provider)
+        if fallback:
+            return fallback
+    raise HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "No AI agent is currently configured. Contact your administrator.",
+    )
+
+
+def _alternatives_with_headroom(profile: dict, usage: dict, global_cfg: dict,
+                                exclude_provider: str) -> list[dict]:
+    """Agents the user could switch to that still have tokens left.
+
+    This is what powers the out-of-tokens prompt: the client gets a concrete
+    list rather than a dead end.
+    """
+    allowed = [m for m in (global_cfg.get("available_models") or []) if model_info(m)]
+    usable = set(available_providers())
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for model in allowed:
+        info = model_info(model)
+        provider = info["provider"]
+        if provider == exclude_provider or provider not in usable or provider in seen:
+            continue
+        cap = cap_for(profile, provider)
+        used = usage["by_provider"][provider]["tokens_used"]
+        if cap and used >= cap:
+            continue
+        seen.add(provider)
+        out.append({
+            "model": model,
+            "provider": provider,
+            "provider_label": PROVIDER_LABELS.get(provider, provider),
+            "label": info["label"],
+            "tokens_used": used,
+            "cap_tokens": cap,
+            "tokens_remaining": max(0, cap - used) if cap else None,
+        })
+    return out
 
 
 @router.post("")
@@ -134,6 +215,10 @@ async def chat(
     if not body.message.strip() and not body.attachment_ids:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Empty message")
 
+    model = _resolve_model(body.model, profile, global_cfg, settings)
+    provider = provider_for_model(model)
+    info = model_info(model) or {}
+
     # Load any referenced attachments up front so we can validate and reuse
     attachments_full = load_attachments_full(user.uid, body.attachment_ids or [])
     if body.attachment_ids and len(attachments_full) != len(body.attachment_ids):
@@ -145,14 +230,28 @@ async def chat(
                 f"Attachment {att.get('id')} is not ready (status: {att.get('status')})",
             )
 
-    # Usage cap check
+    # Usage cap check — per agent, so exhausting one leaves the others usable.
     mkey = month_key()
-    usage_ref = db().collection("usage").document(user.uid).collection("months").document(mkey)
-    usage_snap = usage_ref.get()
-    used = (usage_snap.to_dict() or {}).get("tokens_used", 0) if usage_snap.exists else 0
-    cap = profile.get("cap_tokens", settings.DEFAULT_CAP_TOKENS)
-    if used >= cap:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Monthly token cap reached")
+    usage = read_usage(user.uid, mkey)
+    cap = cap_for(profile, provider)
+    used = usage["by_provider"][provider]["tokens_used"]
+    if cap and used >= cap:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            {
+                "error": "provider_cap_reached",
+                "message": (
+                    f"Your monthly token allowance for "
+                    f"{PROVIDER_LABELS.get(provider, provider)} is used up."
+                ),
+                "provider": provider,
+                "provider_label": PROVIDER_LABELS.get(provider, provider),
+                "model": model,
+                "alternatives": _alternatives_with_headroom(
+                    profile, usage, global_cfg, exclude_provider=provider
+                ),
+            },
+        )
 
     # Persist user message
     user_msg_ref = (
@@ -202,9 +301,17 @@ async def chat(
 
     history = _load_history(user.uid, body.conversation_id)
     system_prompt = _build_system_prompt(user.uid, profile)
-    model = _resolve_model(profile, global_cfg, settings)
+    adapter = get_provider(provider)
 
-    client = OpenAI(api_key=settings.openai_api_key)
+    spec = ChatRequestSpec(
+        model=model,
+        system_prompt=system_prompt,
+        history=history,
+        # Per-model ceiling, because Claude models count thinking against
+        # max_tokens and would truncate at the old flat 4096.
+        max_output_tokens=info.get("max_output_tokens") or settings.MAX_OUTPUT_TOKENS,
+        use_web_tools=True,
+    )
 
     async def stream():
         assistant_text = ""
@@ -213,54 +320,43 @@ async def chat(
         streamed_any = False
         error_message = None
 
-        def open_stream(use_tools: bool):
-            kwargs = dict(
-                model=model,
-                instructions=system_prompt,
-                input=history,
-                max_output_tokens=settings.MAX_OUTPUT_TOKENS,
-                stream=True,
-            )
-            if use_tools:
-                kwargs["tools"] = web_tools()
-            return client.responses.create(**kwargs)
+        # Announce which agent answered so the UI can label the message even if
+        # the user switches agents before the reply lands.
+        yield f"data: {json.dumps({'type': 'meta', 'model': model, 'provider': provider, 'provider_label': PROVIDER_LABELS.get(provider, provider)})}\n\n"
 
-        # Try with the server-side web search tool first. If that fails *before*
-        # any output is produced, retry once without it so the user still gets a
-        # reply rather than a dead, silently-looping turn.
+        # Try with the vendor's web-search tool first. If that fails *before*
+        # any output is produced, retry once without it so the user still gets
+        # a reply rather than a dead, silently-looping turn.
         for use_tools in (True, False):
-            try:
-                for event in open_stream(use_tools):
-                    etype = getattr(event, "type", "")
-                    if etype == "response.output_text.delta":
-                        delta = event.delta
-                        assistant_text += delta
-                        streamed_any = True
-                        yield f"data: {json.dumps({'type': 'chunk', 'text': delta})}\n\n"
-                    elif etype == "response.completed":
-                        usage = getattr(event.response, "usage", None)
-                        if usage is not None:
-                            input_tokens = usage.input_tokens
-                            output_tokens = usage.output_tokens
-                    elif etype in ("response.failed", "error"):
-                        resp = getattr(event, "response", None)
-                        err = getattr(resp, "error", None) or getattr(event, "message", None)
-                        raise RuntimeError(getattr(err, "message", None) or str(err) or "response failed")
-                error_message = None
-                break
-            except Exception as e:
-                if use_tools and not streamed_any:
-                    # Nothing was sent to the client yet — safe to retry cleanly.
-                    assistant_text = ""
-                    continue
-                error_message = str(e)
+            spec.use_web_tools = use_tools
+            assistant_text = ""
+            error_message = None
+            retry = False
+
+            for event in adapter.stream(spec):
+                if isinstance(event, StreamChunk):
+                    assistant_text += event.text
+                    streamed_any = True
+                    yield f"data: {json.dumps({'type': 'chunk', 'text': event.text})}\n\n"
+                elif isinstance(event, StreamDone):
+                    input_tokens = event.input_tokens
+                    output_tokens = event.output_tokens
+                elif isinstance(event, StreamError):
+                    if use_tools and event.retryable_without_tools and not streamed_any:
+                        retry = True
+                    else:
+                        error_message = event.message
+                    break
+
+            if not retry:
                 break
 
         if error_message is not None:
             yield f"data: {json.dumps({'type': 'error', 'message': error_message})}\n\n"
             return
 
-        # Persist assistant message
+        # Persist assistant message. `model` and `provider` are additive fields;
+        # readers that predate them ignore them.
         asst_ref = (
             db()
             .collection("conversations")
@@ -275,6 +371,8 @@ async def chat(
             "uid": user.uid,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "model": model,
+            "provider": provider,
         })
 
         append_to_archive(user.uid, body.conversation_id, {
@@ -283,18 +381,27 @@ async def chat(
             "uid": user.uid,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "model": model,
+            "provider": provider,
         })
 
-        # Update usage counters
-        total = input_tokens + output_tokens
-        usage_ref.set({
-            "tokens_used": (used + total),
-            "input_tokens": (usage_snap.to_dict() or {}).get("input_tokens", 0) + input_tokens if usage_snap.exists else input_tokens,
-            "output_tokens": (usage_snap.to_dict() or {}).get("output_tokens", 0) + output_tokens if usage_snap.exists else output_tokens,
-            "requests": (usage_snap.to_dict() or {}).get("requests", 0) + 1 if usage_snap.exists else 1,
-            "updated_at": now(),
-        }, merge=True)
+        record_usage(user.uid, provider, input_tokens, output_tokens, mkey)
 
-        yield f"data: {json.dumps({'type': 'done', 'input_tokens': input_tokens, 'output_tokens': output_tokens})}\n\n"
+        total_used = used + input_tokens + output_tokens
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "done",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "model": model,
+                "provider": provider,
+                "tokens_used": total_used,
+                "cap_tokens": cap,
+                # Lets the client warn before the next turn is refused.
+                "cap_reached": bool(cap and total_used >= cap),
+            })
+            + "\n\n"
+        )
 
     return StreamingResponse(stream(), media_type="text/event-stream")

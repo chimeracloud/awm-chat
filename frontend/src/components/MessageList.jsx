@@ -43,6 +43,19 @@ export default function MessageList({ messages, streaming }) {
   )
 }
 
+// Display names for the agent byline. Falls back to the raw model ID, so an
+// agent added server-side still renders sensibly without a frontend change.
+const AGENT_LABELS = {
+  'claude-opus-5': 'Claude Opus 5',
+  'claude-sonnet-5': 'Claude Sonnet 5',
+  'claude-haiku-4-5': 'Claude Haiku 4.5',
+  'gpt-4o': 'GPT-4o',
+  'gpt-4o-mini': 'GPT-4o mini',
+  'gpt-4.1': 'GPT-4.1',
+  'gemini-2.5-pro': 'Gemini 2.5 Pro',
+  'gemini-2.5-flash': 'Gemini 2.5 Flash',
+}
+
 function Message({ message }) {
   const isUser = message.role === 'user'
   const atts = message.attachments || []
@@ -59,6 +72,13 @@ function Message({ message }) {
       )}
 
       <div className={`max-w-[88%] ${isUser ? 'order-first' : ''}`}>
+        {/* Which agent answered. Conversations can span agents, so without
+            this a mixed thread is ambiguous on re-read. */}
+        {!isUser && message.model && (
+          <div className="text-[0.65rem] text-ink-300 mb-1 px-1">
+            {AGENT_LABELS[message.model] || message.model}
+          </div>
+        )}
         {atts.length > 0 && (
           <div className={`flex flex-wrap gap-2 mb-2 ${isUser ? 'justify-end' : ''}`}>
             {atts.map((a, i) => <AttachmentChip key={a.id || i} att={a}/>)}

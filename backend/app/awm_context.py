@@ -1,22 +1,23 @@
-"""AWM firm reference + Anthropic web-access tool spec.
+"""AWM firm reference injected into every agent's system prompt.
 
-This module supplies three things to chat.py:
+This module supplies two things to chat.py:
 
 - ``AWM_CONTEXT`` — a curated briefing on Ascot Wealth Management,
-  distilled from ascotwm.com. Injected into every system prompt so
-  Claude answers AWM-specific questions accurately without having to
+  distilled from ascotwm.com. Injected into every system prompt so the
+  agent answers AWM-specific questions accurately without having to
   fetch the site each turn.
 - ``AWM_GUIDANCE`` — short instructions on when to draw on the static
-  context vs. reach for the web tools.
-- ``web_tools()`` — the OpenAI server-side web_search tool
-  specification. Adding it to ``responses.create(...)`` gives the model
-  live internet access during a turn.
+  context vs. reach for web search.
 
-ascotwm.com is a JavaScript-rendered single-page application, so
-Anthropic's ``web_fetch`` will not retrieve useful content from its
-sub-pages. That is why the firm reference is baked in as static
-context here rather than fetched on demand. Refresh ``AWM_CONTEXT``
-periodically (or whenever ascotwm.com is materially updated).
+Both are provider-neutral: the same text is sent to Claude, OpenAI and
+Gemini. Each vendor's web-search tool is declared by its own adapter in
+``providers/`` rather than here, because the three tool specs differ.
+
+ascotwm.com is a JavaScript-rendered single-page application, so web
+fetching will not retrieve useful content from its sub-pages. That is why
+the firm reference is baked in as static context here rather than fetched
+on demand. Refresh ``AWM_CONTEXT`` periodically (or whenever ascotwm.com
+is materially updated).
 
 Last refreshed from ascotwm.com on 2026-05-21.
 """
@@ -214,13 +215,11 @@ about AWM itself — its services, philosophy, team, locations, fees,
 process and tone. Mirror AWM's plain-English, no-jargon,
 transparent-fee style.
 
-You also have access to a server-side web search tool:
-
-- ``web_search`` — searches the live web and reads the resulting
-  pages. Use it for current market information, news, regulatory or
-  tax updates, comparison facts, or general internet research that
-  isn't AWM-specific. For AWM-specific questions rely on the firm
-  reference above and link the user to the relevant ascotwm.com page.
+You also have access to a server-side web search tool. Use it for
+current market information, news, regulatory or tax updates, comparison
+facts, or general internet research that isn't AWM-specific. For
+AWM-specific questions rely on the firm reference above and link the
+user to the relevant ascotwm.com page.
 
 When using web search:
 
@@ -234,14 +233,3 @@ offer", "who's on the team", "how much do we charge"), draw from the
 firm reference above without searching — it is the authoritative
 source.
 """
-
-
-def web_tools() -> list[dict]:
-    """OpenAI server-side web search tool for the Responses API.
-
-    ``{"type": "web_search"}`` is the current built-in web search tool.
-    The model decides when to search; results (with source URLs) are
-    folded into the response server-side, so there is no client-side
-    tool-execution loop to manage.
-    """
-    return [{"type": "web_search"}]

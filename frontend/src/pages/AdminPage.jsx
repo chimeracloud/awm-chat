@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Users, Activity, AlertTriangle, Settings as SettingsIcon } from 'lucide-react'
+import { ArrowLeft, Users, Activity, AlertTriangle, Settings as SettingsIcon, KeyRound } from 'lucide-react'
 import { apiGet, apiPut, apiPost, apiDownload } from '../lib/api'
 import Logo from '../components/Logo'
+import AgentKeysPanel from '../components/AgentKeysPanel'
 
 export default function AdminPage({ user, profile }) {
   const navigate = useNavigate()
@@ -105,6 +106,7 @@ export default function AdminPage({ user, profile }) {
           { id: 'users', label: 'Users', icon: Users },
           { id: 'metrics', label: 'Metrics', icon: Activity },
           { id: 'flags', label: 'Flagged Content', icon: AlertTriangle },
+          { id: 'agents', label: 'Agents & Keys', icon: KeyRound },
           { id: 'settings', label: 'Settings', icon: SettingsIcon },
         ].map(({ id, label, icon: Icon }) => (
           <button
@@ -281,6 +283,13 @@ export default function AdminPage({ user, profile }) {
               </div>
             </div>
           </div>
+        )}
+
+        {tab === 'agents' && (
+          <AgentKeysPanel
+            settings={settings}
+            onSettingsSaved={() => apiGet('/admin/settings').then(setSettings).catch(console.error)}
+          />
         )}
 
         {tab === 'settings' && <SettingsTab settings={settings} onSaved={setSettings} />}

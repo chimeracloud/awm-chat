@@ -1,22 +1,48 @@
 # AWM Chat
 
-Internal Claude-powered chat application for Ascot Wealth Management.
+Internal multi-agent AI chat application for Ascot Wealth Management.
 
 > **AWM Chat is a living tool — it grows with the team.**
 > It ships deliberately lean. New capability — document and image upload, integration with internal company apps, and so on — is added as the team asks for it. See [Roadmap](#roadmap).
 
 ## What this is
 
-A private, company-internal chat interface to Claude with:
+A private, company-internal chat interface to **three AI agents — Claude, OpenAI and Gemini** — with:
 
 * Google Workspace SSO restricted to `@ascotwm.com`
+* **In-chat agent switching**, with all three agents reading the same conversation history
+* **Per-agent monthly token allowances**, with battery-style level indicators
+* **Out-of-tokens handover** — when one agent is spent, the user is offered an agent that isn't, and their message is resent automatically
 * Per-user conversation history with pinned context
-* Admin-controlled AI model selection (per user) and monthly token caps
 * Admin dashboard with usage metrics, content review hooks, and editable settings
 * Compliance audit trail — chats are company property and subject to spot checks
 * GCS-backed append-only conversation archive (BigQuery sink planned for Phase 2)
 
 End-user guide: [`docs/user-manual.md`](docs/user-manual.md).
+
+## Agents
+
+| Agent | Vendor | Models | Key |
+|-------|--------|--------|-----|
+| Claude | Anthropic | Opus 5, Sonnet 5, Haiku 4.5 | `ANTHROPIC_API_KEY` |
+| OpenAI | OpenAI | GPT-4o, GPT-4o mini, GPT-4.1 | `OPENAI_API_KEY` |
+| Gemini | Google | Gemini 2.5 Pro, 2.5 Flash | `GEMINI_API_KEY` |
+
+Which models staff can actually pick is controlled by admins via
+`settings/global.available_models`. An agent whose key is missing is shown
+greyed out in the switcher rather than failing at send time.
+
+### One storage format, three agents
+
+**The stored conversation format never changes.** Firestore and the GCS archive
+hold exactly the shape the app used when it was OpenAI-only; each provider
+adapter in [`backend/app/providers/`](backend/app/providers/) translates that
+shape into its vendor's wire format at send time and never writes it back. That
+is what lets a user switch agent mid-thread and have the new agent read
+everything that came before, including attachments.
+
+The canonical shape is documented in
+[`backend/app/providers/__init__.py`](backend/app/providers/__init__.py).
 
 ## Architecture
 
@@ -29,14 +55,14 @@ End-user guide: [`docs/user-manual.md`](docs/user-manual.md).
                                                        │
                 ┌──────────────────────────────────────┼──────────────────────────────────────┐
                 ▼                                      ▼                                      ▼
-       ┌────────────────┐                    ┌──────────────────┐                    ┌────────────────┐
-       │   Firestore    │                    │       GCS        │                    │  Anthropic API │
-       │  database      │                    │ (chat archives)  │                    │  (Claude)      │
-       │  `awm-chat`    │                    └─────────┬────────┘                    └────────────────┘
-       └────────────────┘                              │
-                                                       ▼
-                                             ┌──────────────────┐
-                                             │  BigQuery        │
+       ┌────────────────┐                    ┌──────────────────┐        ┌───────────────────────┐
+       │   Firestore    │                    │       GCS        │        │  Anthropic  (Claude)  │
+       │  database      │                    │ (chat archives)  │        │  OpenAI     (GPT)     │
+       │  `awm-chat`    │                    └─────────┬────────┘        │  Google     (Gemini)  │
+       └────────────────┘                              │                 └───────────────────────┘
+                                                       ▼                    one adapter each,
+                                             ┌──────────────────┐          translating the same
+                                             │  BigQuery        │          stored format
                                              │  (Phase 2)       │
                                              └──────────────────┘
 ```
@@ -51,13 +77,19 @@ End-user guide: [`docs/user-manual.md`](docs/user-manual.md).
 
 All collections live in the named Firestore database **`awm-chat`** (not the project `(default)`):
 
-* `users/{uid}` — profile, role, monthly token cap, AI model override, acknowledgement flag
+* `users/{uid}` — profile, role, monthly token cap, selected model, acknowledgement flag. Optional `caps_by_provider` sets a narrower allowance for one agent; anything omitted falls back to `cap_tokens`.
 * `conversations/{conv_id}` — owner_uid, title, created_at, updated_at, archived
-* `conversations/{conv_id}/messages/{msg_id}` — role, content, token counts, timestamp
+* `conversations/{conv_id}/messages/{msg_id}` — role, content, token counts, timestamp, plus `model` and `provider` on assistant messages so a mixed-agent thread stays attributable
 * `pins/{uid}/items/{pin_id}` — pinned context snippets always included in the prompt
-* `usage/{uid}/months/{YYYY-MM}` — token counts, request counts
+* `usage/{uid}/months/{YYYY-MM}` — token counts, request counts. The top-level `tokens_used` / `input_tokens` / `output_tokens` / `requests` are unchanged all-agent totals; per-agent figures live under `by_provider.{anthropic,openai,google}`. Documents written before multi-agent support are read as OpenAI usage rather than being backfilled.
 * `audit/{event_id}` — compliance events (admin actions, flag matches, settings changes)
 * `settings/global` — admin-editable defaults: `default_model`, `available_models`, `default_cap_tokens`, `flag_keywords`. Auto-seeded on first read.
+
+**Per-agent allowances.** `cap_tokens` now applies *per agent*, not across all
+of them — each agent gets its own pool of that size. That is deliberate: a
+shared pool would mean running out on one agent means running out on all three,
+which defeats the handover. If you want the old total, divide `cap_tokens` by
+the number of enabled agents or set `caps_by_provider` explicitly.
 
 ### GCS layout
 
@@ -67,18 +99,21 @@ gs://awm-chat-archive/
   exports/{YYYY-MM-DD}/...                # nightly BigQuery exports (Phase 2)
 ```
 
-### Anthropic proxy
+### AI proxy
 
-The backend is the only thing that holds the Anthropic API key (Google Secret Manager). The frontend never sees it. Per request, the proxy:
+The backend is the only thing that holds the vendor API keys (Google Secret Manager). The frontend never sees them. Per request, the proxy:
 
 1. Verifies the user's Firebase JWT
-2. Checks their monthly cap
-3. Loads conversation history + pinned context
-4. Picks the model — per-user `users/{uid}.model` → `settings/global.default_model` → env `CLAUDE_MODEL`
-5. Calls Claude with streaming
+2. Resolves the agent — the model picked in the chat window → per-user `users/{uid}.model` → `settings/global.default_model` → env `DEFAULT_MODEL`, skipping any model that is off the admin allowlist or whose vendor key is missing
+3. Checks the user's monthly cap **for that agent**; if it is spent, returns `429` with the list of agents that still have tokens
+4. Loads conversation history + pinned context (in the canonical format)
+5. Hands it to that vendor's adapter, which translates and streams
 6. Streams the response back to the client
-7. Persists the exchange to Firestore + GCS
-8. Increments usage counters and runs the keyword-flag check
+7. Persists the exchange to Firestore + GCS in the canonical format
+8. Increments per-agent usage counters and runs the keyword-flag check
+
+The cap is checked **before** anything is persisted, so a refused turn leaves no
+stray message behind and the client can safely retry on another agent.
 
 ## Deployment
 
@@ -89,7 +124,8 @@ Live deployment summary:
 3. Frontend: Cloudflare Pages, deployed by the Cloudflare Pages GitHub integration (`npm run build` from `frontend/`, output `dist/`)
 4. Firestore: named database `awm-chat` in `chiops` (set via backend env `FIRESTORE_DATABASE=awm-chat`)
 5. Archive: `gs://awm-chat-archive` (region `europe-west2`)
-6. Secrets: `ANTHROPIC_API_KEY` in Secret Manager (`chiops`)
+6. Secrets in Secret Manager (`chiops`): `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`.
+   Optional, for the org-spend marker only: `ANTHROPIC_ADMIN_KEY`, `OPENAI_ADMIN_KEY`
 7. Bootstrap the first admin: see [Operations](#operations) below
 
 Pushing to `main` triggers both rebuilds independently.
@@ -105,6 +141,32 @@ Pushing to `main` triggers both rebuilds independently.
 | Firestore | Named database `awm-chat` in project `chiops` (location `europe-west2`) |
 | Secrets   | Secret Manager in project `chiops` |
 | Archive   | `gs://awm-chat-archive` (location `europe-west2`) |
+
+### Battery indicators — what they can and cannot show
+
+Each agent in the switcher has a battery. It has two layers, and the reason for
+that split is worth recording so it doesn't get re-litigated:
+
+**No AI vendor exposes a remaining-credit-balance API.** Checked for all three:
+
+| Vendor | What is available | Balance endpoint |
+|--------|-------------------|------------------|
+| Anthropic | Usage & Cost Admin API — `/v1/organizations/usage_report/messages`, `/v1/organizations/cost_report`. Needs an Admin key (`sk-ant-admin01-…`), lands ~5 min after a request | **None.** An open feature request asks for `GET /v1/organizations/me/balance` |
+| OpenAI | `/v1/organization/costs` (admin key) — daily spend | **None.** `/v1/dashboard/billing/credit_grants` is an undocumented console endpoint requiring a browser session token, not an API key |
+| Google | Cloud Billing Budget API, Project Spend Caps, BigQuery billing export | **None.** The AI Studio prepay balance is console-only |
+
+So the battery shows:
+
+1. **The fill — the user's own monthly token allowance for that agent.** Exact,
+   live, needs no admin keys, and is the number that actually gates them. This
+   is what drains as they chat.
+2. **The thin underbar — organisation-wide month-to-date spend against a
+   budget**, read from the vendor's cost API. Best-effort: absent when no admin
+   key or budget is configured, and the UI omits it silently rather than
+   showing a broken gauge.
+
+For a true remaining balance, use each vendor's console. Set hard spend caps
+there as the real backstop.
 
 ### Frontend environment variables (Cloudflare Pages)
 
@@ -132,6 +194,16 @@ Currently set on the `awm-chat` service:
 | `ALLOWED_EMAIL_DOMAIN` | `ascotwm.com` |
 | `CORS_ORIGINS` | `https://chat.chimerasportstrading.com,https://awm-chat.pages.dev,http://localhost:5173` |
 
+Multi-agent additions (all optional — sensible defaults apply):
+
+| Name | Purpose |
+|------|---------|
+| `DEFAULT_MODEL` | Fallback agent when a user has no preference. Defaults to `claude-sonnet-5` |
+| `DEFAULT_CAP_TOKENS` | Monthly allowance **per agent** per user. Defaults to `500000` |
+| `ANTHROPIC_BUDGET_USD` / `OPENAI_BUDGET_USD` / `GOOGLE_BUDGET_USD` | Monthly budget each agent's spend marker is measured against. `0` hides the marker |
+| `GCP_BILLING_EXPORT_TABLE` | BigQuery table of the GCP billing export, e.g. `chiops.billing.gcp_billing_export_v1_XXXX`. Required for the Gemini spend marker — Google has no cost endpoint |
+| `PROVIDER_SPEND_CACHE_SECONDS` | How long vendor spend is cached. Defaults to `300` |
+
 Update with:
 
 ```bash
@@ -152,7 +224,7 @@ The service runs as the default compute SA: `991649774709-compute@developer.gser
 |------|-------|-----|
 | `roles/datastore.user` | project-wide | Firestore reads/writes |
 | `roles/storage.objectAdmin` | on bucket `awm-chat-archive` | append-only conversation archive |
-| `roles/secretmanager.secretAccessor` | on secret `ANTHROPIC_API_KEY` | read the Claude API key |
+| `roles/secretmanager.secretAccessor` | on secrets `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` | read the vendor API keys |
 
 Symptom of a missing `secretAccessor` (or equivalent): a 500 on `POST /chat` with `Permission 'secretmanager.versions.access' denied` in Cloud Run logs.
 
@@ -205,7 +277,7 @@ If you need something that isn't here yet, that's a feature request, not a limit
 ## Stack
 
 * Frontend: React 18, Vite, Tailwind CSS, Firebase JS SDK
-* Backend: Python 3.12, FastAPI, google-cloud-firestore, google-cloud-storage, anthropic, firebase-admin
+* Backend: Python 3.12, FastAPI, google-cloud-firestore, google-cloud-storage, anthropic + openai + google-genai, firebase-admin
 * Hosting: Cloudflare Pages (frontend), Cloud Run `europe-west1` (backend)
 * Identity: Firebase Auth (Google SSO)
 * Storage: Firestore (named DB `awm-chat`) + GCS

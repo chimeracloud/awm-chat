@@ -4,6 +4,7 @@ import {
   FileText, Image as ImageIcon, Film, Loader2, CheckCircle2,
 } from 'lucide-react'
 import { uploadAttachment } from '../lib/api'
+import AgentSwitcher from './AgentSwitcher'
 
 const MAX_ATTACHMENTS = 5
 
@@ -32,7 +33,9 @@ function CategoryIcon({ contentType, size = 14 }) {
   return <FileText size={size} />
 }
 
-export default function Composer({ onSend, disabled, usage }) {
+export default function Composer({
+  onSend, disabled, agents, selectedModel, onSelectModel,
+}) {
   const [text, setText] = useState('')
   const [pending, setPending] = useState([])  // local upload state
   const taRef = useRef(null)
@@ -46,9 +49,23 @@ export default function Composer({ onSend, disabled, usage }) {
   }, [text])
 
   const anyBusy = pending.some(p => p.status === 'uploading' || p.status === 'processing')
-  const overLimit = usage && usage.cap_tokens && usage.tokens_used >= usage.cap_tokens
+
+  // The gate is now per agent: being out of tokens on one agent doesn't stop
+  // you writing, because you can switch to one that still has headroom.
+  const activeAgent = (agents || []).find(a =>
+    a.models.some(m => m.id === selectedModel)
+  )
+  const overLimit = Boolean(activeAgent?.allowance?.exhausted)
+  const anyAgentHasHeadroom = (agents || []).some(
+    a => a.available && !a.allowance.exhausted
+  )
   const readyAttachments = pending.filter(p => p.status === 'ready')
-  const canSend = !disabled && !overLimit && !anyBusy &&
+  // If the active agent is spent but another isn't, keep Send live: the server
+  // refuses with the list of agents that still have tokens and the dialog
+  // offers a one-click switch that resends. The cap is checked before anything
+  // is persisted, so that round trip costs nothing.
+  const hardBlocked = overLimit && !anyAgentHasHeadroom
+  const canSend = !disabled && !hardBlocked && !anyBusy &&
                   (text.trim().length > 0 || readyAttachments.length > 0)
 
   function pickFiles() {
@@ -131,8 +148,14 @@ export default function Composer({ onSend, disabled, usage }) {
     <div className="border-t border-ink-500/60 bg-ink-800/40 backdrop-blur">
       <div className="max-w-3xl mx-auto px-6 py-4">
         {overLimit && (
-          <div className="mb-3 flex items-center gap-2 px-3 py-2 bg-accent-danger/10 border border-accent-danger/30 rounded text-sm text-accent-danger">
-            <AlertCircle size={14}/> Monthly token cap reached. Contact your administrator.
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 bg-accent-danger/10 border border-accent-danger/30 rounded text-sm text-accent-danger">
+            <AlertCircle size={14} className="mt-0.5 flex-shrink-0"/>
+            <span>
+              {activeAgent?.label} has used its monthly token allowance.{' '}
+              {anyAgentHasHeadroom
+                ? 'Pick another agent below — your message will send straight away.'
+                : 'All your agents are out of tokens. Contact your administrator.'}
+            </span>
           </div>
         )}
 
@@ -184,12 +207,21 @@ export default function Composer({ onSend, disabled, usage }) {
           </div>
         )}
 
+        <div className="mb-2 flex items-center gap-2">
+          <AgentSwitcher
+            agents={agents}
+            selectedModel={selectedModel}
+            onSelect={onSelectModel}
+            disabled={disabled}
+          />
+        </div>
+
         <div className={`flex items-end gap-2 bg-ink-700/60 border rounded-xl p-2.5 transition-colors ${
-          disabled || overLimit ? 'border-ink-500/40 opacity-70' : 'border-ink-500 focus-within:border-gold-500/40'
+          disabled || hardBlocked ? 'border-ink-500/40 opacity-70' : 'border-ink-500 focus-within:border-gold-500/40'
         }`}>
           <button
             onClick={pickFiles}
-            disabled={disabled || overLimit || pending.length >= MAX_ATTACHMENTS}
+            disabled={disabled || hardBlocked || pending.length >= MAX_ATTACHMENTS}
             className="flex-shrink-0 w-9 h-9 flex items-center justify-center text-cream-300 hover:text-cream-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
             title="Attach files"
           >
@@ -208,9 +240,9 @@ export default function Composer({ onSend, disabled, usage }) {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="Message Claude..."
+            placeholder={activeAgent ? `Message ${activeAgent.label}...` : 'Message your AI agent...'}
             rows={1}
-            disabled={disabled || overLimit}
+            disabled={disabled || hardBlocked}
             className="flex-1 bg-transparent resize-none text-cream-50 placeholder-ink-300 focus:outline-none px-2 py-1.5 max-h-60 text-[15px]"
           />
           <button
@@ -224,7 +256,7 @@ export default function Composer({ onSend, disabled, usage }) {
         </div>
 
         <p className="text-[0.7rem] text-ink-300 text-center mt-2">
-          Claude can make mistakes. Verify critical information.
+          {activeAgent?.label || 'AI agents'} can make mistakes. Verify critical information.
         </p>
       </div>
     </div>

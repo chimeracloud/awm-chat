@@ -65,11 +65,33 @@ done
 
 ## 6. Secrets
 
+One inference key per agent — all three are required for the full switcher
+(an agent whose key is missing is greyed out rather than broken):
+
 ```bash
-echo -n "sk-ant-..." | gcloud secrets create ANTHROPIC_API_KEY --data-file=-
+echo -n "sk-ant-..."  | gcloud secrets create ANTHROPIC_API_KEY --data-file=-
+echo -n "sk-proj-..." | gcloud secrets create OPENAI_API_KEY    --data-file=-
+echo -n "AIza..."     | gcloud secrets create GEMINI_API_KEY    --data-file=-
 ```
 
-If you rotate, add a new version: `gcloud secrets versions add ANTHROPIC_API_KEY --data-file=-`.
+If you rotate, add a new version: `gcloud secrets versions add <NAME> --data-file=-`.
+
+**Optional — the org-spend marker on each battery.** These are *admin* keys,
+separate from the inference keys above, and are only used to read month-to-date
+spend. Without them the batteries still work; they just show your own token
+allowance and omit the spend underbar.
+
+```bash
+echo -n "sk-ant-admin01-..." | gcloud secrets create ANTHROPIC_ADMIN_KEY --data-file=-
+echo -n "sk-admin-..."       | gcloud secrets create OPENAI_ADMIN_KEY    --data-file=-
+```
+
+Set a budget per agent to make the marker meaningful (0 hides it):
+`ANTHROPIC_BUDGET_USD`, `OPENAI_BUDGET_USD`, `GOOGLE_BUDGET_USD`.
+
+Gemini spend has no cost endpoint at all — it is only readable from the GCP
+billing export. Enable the export to BigQuery and set
+`GCP_BILLING_EXPORT_TABLE` to the table name to light up that marker.
 
 ## 7. Firebase
 
@@ -138,6 +160,6 @@ gcloud firestore documents update users/YOUR_UID \
 ## Ongoing
 
 * Per-user caps: set in Admin > Users
-* Spend cap on the Anthropic console as a hard backstop
+* Spend caps in each vendor's console (Anthropic, OpenAI, Google AI Studio) as a hard backstop — none of the three exposes a credit balance over the API, so the console is the only place a true remaining balance is visible
 * BigQuery sink (Phase 2): scheduled Cloud Run job that reads GCS NDJSON and loads into BigQuery for the data lake
 * RAG (Phase 2): embeddings written on each turn into Vertex AI Vector Search, retrieved when conversation history exceeds the context window
