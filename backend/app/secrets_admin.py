@@ -108,15 +108,25 @@ def _validate(name: str, value: str) -> tuple[bool, str]:
     provider, kind = meta["provider"], meta["kind"]
     try:
         if kind == "inference":
+            # Each client is bound to a local. Constructing one inline and
+            # chaining off it leaves no reference, so the client can be
+            # garbage-collected — and closed — before a lazily-paginated call
+            # actually issues its request. google-genai's models.list() is
+            # lazy, and that pattern fails with "Cannot send a request, as the
+            # client has been closed" rather than reporting the real result.
             if provider == ANTHROPIC:
                 import anthropic
-                anthropic.Anthropic(api_key=value).models.list(limit=1)
+                client = anthropic.Anthropic(api_key=value)
+                client.models.list(limit=1)
             elif provider == OPENAI:
                 from openai import OpenAI
-                OpenAI(api_key=value).models.list()
+                client = OpenAI(api_key=value)
+                client.models.list()
             elif provider == GOOGLE:
                 from google import genai
-                list(genai.Client(api_key=value).models.list())
+                client = genai.Client(api_key=value)
+                # One page is enough to prove the key; don't walk the catalog.
+                next(iter(client.models.list()), None)
         else:
             import requests
             from datetime import timedelta
