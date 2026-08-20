@@ -11,9 +11,16 @@ class StreamChunk:
 
 @dataclass
 class StreamDone:
-    """End of a successful turn, with the vendor's own token accounting."""
+    """End of a successful turn, with the vendor's own token accounting.
+
+    `cache_read_tokens` / `cache_write_tokens` are reported separately so the
+    saving is visible, but they are still folded into `input_tokens` for the
+    user's allowance — a cached token is cheaper, not free.
+    """
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass
@@ -28,13 +35,28 @@ StreamEvent = StreamChunk | StreamDone | StreamError
 
 @dataclass
 class ChatRequestSpec:
-    """Everything a provider needs for one turn, in canonical form."""
+    """Everything a provider needs for one turn, in canonical form.
+
+    The system prompt is split so the bulk of it can be cached. `system_stable`
+    is byte-identical for every user on every day, which is what makes it a
+    cacheable prefix shared across the whole firm; `system_volatile` holds the
+    parts that change (who is speaking, today's date, their pinned context) and
+    must always come *after* it. Providers that cache automatically do so on the
+    longest common prefix, so this ordering is the whole mechanism for them.
+    """
     model: str
-    system_prompt: str
+    system_stable: str
+    system_volatile: str
     history: list[dict]
     max_output_tokens: int
     use_web_tools: bool = True
     extra: dict = field(default_factory=dict)
+
+    @property
+    def system_prompt(self) -> str:
+        """Stable-then-volatile, for providers that take a single string."""
+        volatile = self.system_volatile.strip()
+        return self.system_stable + ("\n\n" + volatile if volatile else "")
 
 
 class ChatProvider(Protocol):

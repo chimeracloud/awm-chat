@@ -129,10 +129,35 @@ class AnthropicProvider(ChatProvider):
             yield StreamError("No usable conversation history for this agent.")
             return
 
+        # Anthropic caches explicitly. The breakpoint goes on the stable half
+        # of the system prompt, which is byte-identical for every user in the
+        # firm — so the first request of the day warms it and everyone else
+        # reads it back at a fraction of the price. The volatile half follows
+        # it uncached; it is small, and keeping it outside the breakpoint is
+        # what stops the daily date change invalidating the whole prefix.
+        system: list[dict] = [{
+            "type": "text",
+            "text": spec.system_stable,
+            "cache_control": {"type": "ephemeral"},
+        }]
+        volatile = spec.system_volatile.strip()
+        if volatile:
+            system.append({"type": "text", "text": volatile})
+
+        # Second breakpoint at the end of the settled history. The newest
+        # message is left outside it deliberately: attachments on the newest
+        # turn are sent natively and switch to their text layer once they are
+        # no longer newest, so including it would invalidate the prefix on the
+        # very next turn.
+        if len(messages) >= 2:
+            tail = messages[-2]["content"]
+            if isinstance(tail, list) and tail:
+                tail[-1] = {**tail[-1], "cache_control": {"type": "ephemeral"}}
+
         kwargs: dict = {
             "model": spec.model,
             "max_tokens": spec.max_output_tokens,
-            "system": spec.system_prompt,
+            "system": system,
             "messages": messages,
         }
         if info.get("adaptive_thinking"):
@@ -144,6 +169,7 @@ class AnthropicProvider(ChatProvider):
 
         streamed_any = False
         input_tokens = output_tokens = 0
+        cache_read = cache_write = 0
 
         try:
             with client.messages.stream(**kwargs) as stream:
@@ -157,11 +183,9 @@ class AnthropicProvider(ChatProvider):
             if usage is not None:
                 # Cache reads/writes are billed differently but still consume
                 # the user's allowance, so fold them into the input count.
-                input_tokens = (
-                    (usage.input_tokens or 0)
-                    + (getattr(usage, "cache_read_input_tokens", 0) or 0)
-                    + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
-                )
+                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+                cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                input_tokens = (usage.input_tokens or 0) + cache_read + cache_write
                 output_tokens = usage.output_tokens or 0
 
             if getattr(final, "stop_reason", None) == "refusal":
@@ -177,4 +201,9 @@ class AnthropicProvider(ChatProvider):
             yield StreamError(str(e), retryable_without_tools=not streamed_any)
             return
 
-        yield StreamDone(input_tokens=input_tokens, output_tokens=output_tokens)
+        yield StreamDone(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        )

@@ -58,25 +58,40 @@ def _scan_for_flags(text: str, keywords: list[str]) -> list[str]:
     return [kw for kw in keywords if kw and kw in s]
 
 
-def _build_system_prompt(uid: str, profile: dict) -> str:
-    pins_q = db().collection("pins").document(uid).collection("items").stream()
+# The cacheable half of the system prompt: byte-identical for every user, every
+# day, so it is one shared cache entry across the whole firm rather than one per
+# person. Built once at import — anything that varies belongs in the volatile
+# half below, or it would silently defeat the cache for everyone.
+SYSTEM_STABLE = (
+    "You are an internal assistant for Ascot Wealth Management, a UK financial "
+    "advisory firm established in 2010. You are speaking with a member of AWM "
+    "staff. Be precise, professional, and useful. When uncertain, say so plainly. "
+    "Do not fabricate regulatory or compliance specifics.\n\n"
+    + AWM_CONTEXT.strip()
+    + "\n\n"
+    + AWM_GUIDANCE.strip()
+)
+
+
+def _build_volatile_prompt(uid: str, profile: dict) -> str:
+    """The part of the system prompt that legitimately changes.
+
+    Kept deliberately small and always placed *after* `SYSTEM_STABLE`. The date
+    used to sit in the opening sentence, which meant the entire prompt — all
+    2,300 tokens of firm context — changed at midnight and could never be
+    cached. Pinned context had the same effect whenever anyone edited a pin.
+    """
     pin_lines = []
-    for p in pins_q:
+    for p in db().collection("pins").document(uid).collection("items").stream():
         d = p.to_dict()
         label = d.get("label") or "Context"
         pin_lines.append(f"- [{label}] {d.get('content', '')}")
 
-    base = (
-        f"You are an internal assistant for Ascot Wealth Management, a UK financial advisory firm "
-        f"established in 2010. You are speaking with {profile.get('display_name') or profile.get('email')}, "
-        f"an AWM staff member. Be precise, professional, and useful. When uncertain, say so plainly. "
-        f"Do not fabricate regulatory or compliance specifics. Today is {now().strftime('%Y-%m-%d')}.\n\n"
-    )
-    base += AWM_CONTEXT.strip() + "\n\n"
-    base += AWM_GUIDANCE.strip() + "\n\n"
+    who = profile.get("display_name") or profile.get("email") or "an AWM staff member"
+    parts = [f"You are speaking with {who}. Today is {now().strftime('%Y-%m-%d')}."]
     if pin_lines:
-        base += "User pinned context (always consider):\n" + "\n".join(pin_lines) + "\n"
-    return base
+        parts.append("User pinned context (always consider):\n" + "\n".join(pin_lines))
+    return "\n\n".join(parts)
 
 
 def firestore_desc():
@@ -358,12 +373,12 @@ async def chat(
     append_to_archive(user.uid, body.conversation_id, archive_payload)
 
     history = _load_history(user.uid, body.conversation_id)
-    system_prompt = _build_system_prompt(user.uid, profile)
     adapter = get_provider(provider)
 
     spec = ChatRequestSpec(
         model=model,
-        system_prompt=system_prompt,
+        system_stable=SYSTEM_STABLE,
+        system_volatile=_build_volatile_prompt(user.uid, profile),
         history=history,
         # Per-model ceiling, because Claude models count thinking against
         # max_tokens and would truncate at the old flat 4096.
@@ -375,6 +390,8 @@ async def chat(
         assistant_text = ""
         input_tokens = 0
         output_tokens = 0
+        cache_read = 0
+        cache_write = 0
         streamed_any = False
         error_message = None
 
@@ -399,6 +416,8 @@ async def chat(
                 elif isinstance(event, StreamDone):
                     input_tokens = event.input_tokens
                     output_tokens = event.output_tokens
+                    cache_read = event.cache_read_tokens
+                    cache_write = event.cache_write_tokens
                 elif isinstance(event, StreamError):
                     if use_tools and event.retryable_without_tools and not streamed_any:
                         retry = True
@@ -452,6 +471,9 @@ async def chat(
                 "type": "done",
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                # Visible so the saving can be checked rather than assumed.
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
                 "model": model,
                 "provider": provider,
                 "tokens_used": total_used,
