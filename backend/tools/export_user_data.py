@@ -71,12 +71,20 @@ def _safe(name: str, fallback: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Export one user's AWM Chat data.")
-    ap.add_argument("--uid", required=True, help="Firestore user id (Admin -> Users)")
+    ap.add_argument("--uid", help="Firestore user id (Admin -> Users)")
+    ap.add_argument("--email", help="Look the user up by email instead of uid")
     ap.add_argument("--project", default=os.getenv("GCP_PROJECT", "chiops"))
     ap.add_argument("--database", default=os.getenv("FIRESTORE_DATABASE", "awm-chat"))
     ap.add_argument("--bucket", default=os.getenv("GCS_ARCHIVE_BUCKET", "awm-chat-archive"))
     ap.add_argument("--label", default="user", help="Name used for the output folder/zip")
     ap.add_argument("--out", default=".", help="Directory to write the export into")
+    ap.add_argument(
+        "--markdown-only", action="store_true",
+        help="Skip downloading original attachment binaries. Extracted text and "
+             "transcripts are still written, so nothing readable is lost. Use this "
+             "for Claude Project knowledge, which takes text and would be blown "
+             "past its size limit by raw PDFs and video files.",
+    )
     args = ap.parse_args()
 
     db = firestore.Client(project=args.project, database=args.database)
@@ -85,6 +93,18 @@ def main() -> None:
     root = Path(args.out) / f"{args.label}_export"
     conv_dir = root / "conversations"
     data_dir = root / "data"
+    if not args.uid:
+        if not args.email:
+            ap.error("give either --uid or --email")
+        match = next(
+            iter(db.collection("users").where("email", "==", args.email.lower()).limit(1).stream()),
+            None,
+        )
+        if match is None:
+            ap.error(f"no user found with email {args.email}")
+        args.uid = match.id
+        print(f"Resolved {args.email} -> {args.uid}")
+
     att_dir = root / "attachments"
     for d in (conv_dir, data_dir, att_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -174,7 +194,7 @@ def main() -> None:
             "has_transcript": bool(a.get("transcript")),
         })
         gcs_path = a.get("gcs_path")
-        if gcs_path:
+        if gcs_path and not args.markdown_only:
             blob = bucket.blob(gcs_path)
             if blob.exists():
                 out_name = f"{a.get('id')}__{_safe(a.get('filename'), 'file')}"
