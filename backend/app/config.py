@@ -94,7 +94,12 @@ class Settings:
 
     DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "claude-sonnet-5")
     MAX_OUTPUT_TOKENS: int = int(os.getenv("MAX_OUTPUT_TOKENS", "4096"))
+    # Hard ceiling on replayed history. A message count alone is meaningless —
+    # forty one-liners is nothing, forty with a report attached will exceed a
+    # provider's per-minute limit on its own. The count is kept as a cheap
+    # upper bound on Firestore reads; the token budget is what actually binds.
     CONTEXT_WINDOW_MESSAGES: int = int(os.getenv("CONTEXT_WINDOW_MESSAGES", "40"))
+    HISTORY_TOKEN_BUDGET: int = int(os.getenv("HISTORY_TOKEN_BUDGET", "25000"))
     CORS_ORIGINS: list[str] = os.getenv(
         "CORS_ORIGINS",
         "https://chat.chimerasportstrading.com,https://awm-chat.pages.dev,http://localhost:5173",

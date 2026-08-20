@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .attachments import (
+    MAX_EXTRACTED_CHARS,
     build_content_parts,
     flag_scan_corpus,
     lightweight_attachment,
@@ -84,12 +85,52 @@ def firestore_desc():
     return Query.DESCENDING
 
 
+# Rough token estimates, used only to decide what fits — never for billing.
+# Deliberately pessimistic: over-estimating trims an extra message, whereas
+# under-estimating produces the oversized request we are trying to prevent.
+_CHARS_PER_TOKEN = 4
+_IMAGE_TOKENS = 1_500          # a tiled image at "auto" detail
+_NATIVE_PDF_TOKENS_PER_BYTE = 0.03   # text + one rendered image per page
+
+
+def _estimate_message_tokens(msg: dict, *, native: bool) -> int:
+    """Size a stored message without reading its attachments back.
+
+    Works purely from the message document, so trimming happens *before* any
+    GCS download — messages that fall outside the budget cost nothing to skip.
+    """
+    total = len(msg.get("content") or "") // _CHARS_PER_TOKEN
+    for att in msg.get("attachments") or []:
+        ct = att.get("content_type") or ""
+        size = att.get("size") or 0
+        if ct.startswith("image/"):
+            total += _IMAGE_TOKENS
+        elif ct == "application/pdf" and native:
+            total += int(size * _NATIVE_PDF_TOKENS_PER_BYTE)
+        else:
+            # Sent as text: prefer the recorded length, else assume the cap.
+            chars = att.get("extracted_chars") or MAX_EXTRACTED_CHARS
+            total += min(chars, MAX_EXTRACTED_CHARS) // _CHARS_PER_TOKEN
+    return total
+
+
 def _load_history(uid: str, conv_id: str) -> list[dict]:
     """Load recent messages in chronological order, in the canonical format.
 
     This is provider-agnostic on purpose — the same list is handed to whichever
     adapter is serving the turn, which is what lets a conversation continue
     across agents.
+
+    Two things keep a long thread from growing without bound:
+
+    * **A token budget, not just a message count.** Messages are taken newest
+      first until the budget is spent. Forty short messages and forty with a
+      report attached are wildly different requests; only a token budget bounds
+      both.
+    * **Full attachment fidelity for the newest message only.** A PDF costs its
+      text plus a rendered image per page every time it is sent natively.
+      Earlier turns get the stored text layer instead, which still lets the
+      model quote the document at a fraction of the size.
     """
     settings = get_settings()
     msgs_ref = (
@@ -108,13 +149,30 @@ def _load_history(uid: str, conv_id: str) -> list[dict]:
 
     items = [m.to_dict() for m in raw]
     items.reverse()
+    items = [m for m in items if (m.get("content") or "") or (m.get("attachments") or [])]
+    if not items:
+        return []
+
+    # Walk backwards from the newest message, keeping what fits. The newest is
+    # always kept even if it alone blows the budget — dropping it would mean
+    # sending nothing at all, and the provider's own error is a better outcome
+    # than a silently empty request.
+    budget = settings.HISTORY_TOKEN_BUDGET
+    newest_index = len(items) - 1
+    keep_from = newest_index
+    spent = _estimate_message_tokens(items[newest_index], native=True)
+    for i in range(newest_index - 1, -1, -1):
+        cost = _estimate_message_tokens(items[i], native=False)
+        if spent + cost > budget:
+            break
+        spent += cost
+        keep_from = i
 
     history: list[dict] = []
-    for m in items:
+    for i in range(keep_from, len(items)):
+        m = items[i]
         att_refs = m.get("attachments") or []
         text = m.get("content") or ""
-        if not text and not att_refs:
-            continue
         if not att_refs:
             history.append({"role": m["role"], "content": text})
             continue
@@ -122,7 +180,7 @@ def _load_history(uid: str, conv_id: str) -> list[dict]:
         atts_full = load_attachments_full(uid, ids)
         history.append({
             "role": m["role"],
-            "content": build_content_parts(text, atts_full),
+            "content": build_content_parts(text, atts_full, native=(i == newest_index)),
         })
     return history
 

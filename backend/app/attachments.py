@@ -55,7 +55,10 @@ DOC_MAX = 10 * 1024 * 1024       # 10 MB
 IMAGE_MAX = 5 * 1024 * 1024      # 5 MB (Anthropic image limit)
 VIDEO_MAX = 100 * 1024 * 1024    # 100 MB
 
-MAX_EXTRACTED_CHARS = 200_000    # cap text extraction to keep prompts sane
+# ~4 chars per token, so this is roughly a 10k-token ceiling per document.
+# The old 200k (~50k tokens) meant a single report could outweigh an entire
+# conversation and, on its own, exceed a provider's per-minute token limit.
+MAX_EXTRACTED_CHARS = 40_000
 
 
 def _classify(content_type: str) -> tuple[str, int] | None:
@@ -106,6 +109,39 @@ def _sign_url(blob, *, method: str, content_type: str | None = None,
 
 # ---------------------- Text extraction & transcription ----------------------
 
+def _truncate(text: str) -> str:
+    """Cap extracted text, telling the model when it is only seeing part."""
+    if len(text) <= MAX_EXTRACTED_CHARS:
+        return text
+    return (
+        text[:MAX_EXTRACTED_CHARS]
+        + "\n\n[Document truncated here — this is the first "
+        + f"{MAX_EXTRACTED_CHARS:,} characters only. Ask the user to re-attach "
+        + "the relevant section if you need more.]"
+    )
+
+
+def _extract_pdf(raw: bytes) -> str:
+    """Pull the text layer out of a PDF.
+
+    Extracted at upload so later turns can reference a document by its text
+    instead of re-sending the whole file. Scanned PDFs have no text layer and
+    return "" — `build_content_parts` detects that and keeps sending those
+    natively, since text is not an option for them.
+    """
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(raw))
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            continue  # one unreadable page shouldn't lose the rest
+        if text.strip():
+            pages.append(text.strip())
+    return _truncate("\n\n".join(pages))
+
+
 def _extract_docx(raw: bytes) -> str:
     from docx import Document
     doc = Document(io.BytesIO(raw))
@@ -118,14 +154,14 @@ def _extract_docx(raw: bytes) -> str:
             row_cells = [cell.text for cell in row.cells if cell.text]
             if row_cells:
                 parts.append(" | ".join(row_cells))
-    return "\n".join(parts)[:MAX_EXTRACTED_CHARS]
+    return _truncate("\n".join(parts))
 
 
 def _extract_text_like(raw: bytes) -> str:
     try:
-        return raw.decode("utf-8", errors="replace")[:MAX_EXTRACTED_CHARS]
+        return _truncate(raw.decode("utf-8", errors="replace"))
     except Exception:
-        return raw.decode("latin-1", errors="replace")[:MAX_EXTRACTED_CHARS]
+        return _truncate(raw.decode("latin-1", errors="replace"))
 
 
 def _transcribe_video(gcs_uri: str) -> str:
@@ -164,13 +200,24 @@ def _transcribe_video(gcs_uri: str) -> str:
 
 # ---------------------- Content-block construction ----------------------
 
-def build_content_parts(text: str, attachments_full: list[dict]) -> list[dict]:
+def build_content_parts(
+    text: str, attachments_full: list[dict], *, native: bool = True
+) -> list[dict]:
     """Build the OpenAI Responses `input` content parts for one user message.
 
     `attachments_full` are full Firestore attachment records (with gcs_path,
-    extracted_text, transcript). Image / PDF binaries are fetched from GCS
-    and base64-encoded into data URLs. DOCX/TXT/CSV use stored extracted
-    text. Video uses the stored transcript only.
+    extracted_text, transcript). Video uses the stored transcript only.
+
+    `native` controls PDF fidelity and is the lever that keeps long
+    conversations affordable. A PDF sent natively is billed as its text *plus*
+    an image per page — tens of thousands of tokens — and the old code paid
+    that on every single turn for the life of the thread. With `native=False`
+    the stored text layer is sent instead, which is a fraction of the size and
+    still lets the model quote and reason about the document. Callers give
+    full fidelity to the newest message only.
+
+    Scanned PDFs have no text layer, so they stay native regardless — for
+    those, downgrading would mean sending nothing at all.
     """
     bucket = archive_bucket()
     parts: list[dict] = []
@@ -178,6 +225,17 @@ def build_content_parts(text: str, attachments_full: list[dict]) -> list[dict]:
         ct = att.get("content_type", "")
         filename = att.get("filename") or "attachment"
         if ct == "application/pdf":
+            pdf_text = att.get("extracted_text")
+            if not native and pdf_text:
+                parts.append({
+                    "type": "input_text",
+                    "text": (
+                        f"[Attached document: {filename} — text of a PDF sent "
+                        f"earlier in this conversation]\n\n{pdf_text}\n\n"
+                        f"[End of attached document.]"
+                    ),
+                })
+                continue
             raw = bucket.blob(att["gcs_path"]).download_as_bytes()
             b64 = base64.standard_b64encode(raw).decode("ascii")
             parts.append({
@@ -228,13 +286,19 @@ def load_attachments_full(uid: str, attachment_ids: list[str]) -> list[dict]:
 
 
 def lightweight_attachment(att: dict) -> dict:
-    """The subset stored on a message doc for rendering in the chat UI."""
+    """The subset stored on a message doc for rendering in the chat UI.
+
+    `extracted_chars` also lets the history budgeter size a message without
+    re-reading the attachment record from Firestore or GCS. Messages written
+    before this field existed simply fall back to a size-based estimate.
+    """
     return {
         "id": att.get("id"),
         "filename": att.get("filename"),
         "content_type": att.get("content_type"),
         "category": att.get("category"),
         "size": att.get("actual_size") or att.get("size"),
+        "extracted_chars": len(att.get("extracted_text") or "") or None,
     }
 
 
@@ -365,10 +429,15 @@ async def complete_upload(
             "text/plain", "text/markdown", "text/x-markdown", "text/csv",
         ):
             update["extracted_text"] = _extract_text_like(blob.download_as_bytes())
+        elif category == "document" and ct == "application/pdf":
+            # Extracted once here so later turns can cite the document by text
+            # rather than re-uploading it. Empty for scanned PDFs, which then
+            # keep being sent natively.
+            update["extracted_text"] = _extract_pdf(blob.download_as_bytes())
         elif category == "video":
             bucket_name = get_settings().GCS_ARCHIVE_BUCKET
             update["transcript"] = _transcribe_video(f"gs://{bucket_name}/{data['gcs_path']}")
-        # PDF + images: nothing to pre-extract — sent native to Claude at chat time
+        # Images have nothing to pre-extract — always sent natively.
     except Exception as e:
         ref.update({"status": "error", "error": str(e)[:500]})
         raise HTTPException(
