@@ -115,6 +115,44 @@ The backend is the only thing that holds the vendor API keys (Google Secret Mana
 The cap is checked **before** anything is persisted, so a refused turn leaves no
 stray message behind and the client can safely retry on another agent.
 
+### Context and cost control
+
+A long thread with a document attached is dominated by that document, not by the
+conversation. Two mechanisms keep a turn's request size bounded — both are
+described in full in [`CHANGELOG.md`](CHANGELOG.md) 0.6.0.
+
+**Attachment fidelity is newest-message-only.** A PDF sent natively is billed as
+its text *plus* a rendered image per page. Only the newest message sends
+attachments natively; earlier turns send the stored text layer, which still lets
+the model quote and reason about the document at roughly a quarter of the size.
+Scanned PDFs have no text layer and stay native — downgrading those would send
+nothing at all. PDF text is extracted at upload with pypdf;
+`MAX_EXTRACTED_CHARS` (40,000) bounds it and truncation is marked in-band.
+
+**History is bounded by a token budget, not a message count.** Messages are taken
+newest-first until the budget is spent, estimated from the message document alone
+so trimming happens before any GCS download. The newest message is always kept
+even if it alone exceeds the budget — the provider's own error is better than
+silently sending an empty request.
+
+**Prompt caching.** The system prompt is split into `SYSTEM_STABLE` — firm
+context and guidance, byte-identical for every user on every day — and a small
+volatile half holding the user's name, today's date and their pins, always placed
+after it. Anthropic marks the boundary with `cache_control`; OpenAI and Gemini
+cache the longest common prefix automatically, so for them the ordering is the
+whole mechanism. `cache_read_tokens` / `cache_write_tokens` come back on the
+`done` event. **Cached tokens are cheaper, not free** — they still count toward
+the user's allowance and do not relieve per-minute rate limits.
+
+### Maintenance tools
+
+Both live in `backend/tools/` and run from a workstation against production.
+
+| Tool | What |
+|---|---|
+| `export_user_data.py` | Exports one user's data to a zip. `--email` resolves the uid; `--markdown-only` skips attachment binaries while still writing extracted text and transcripts. **Use this rather than the in-app export for large accounts** — the in-app route builds the zip in memory inside a Cloud Run request, and for a heavy user it exhausts the container or outruns the timeout, which the browser reports as "Load failed" with no HTTP error. |
+| `backfill_pdf_text.py` | Extracts and stores the text layer for PDFs uploaded before extraction existed. Without it those keep being sent natively on every turn. Idempotent, dry-run by default. |
+
 ## Deployment
 
 Live deployment summary:
@@ -259,13 +297,14 @@ There is no admin-bootstrap script. To grant admin to a user (including the firs
 
 ## Roadmap
 
-AWM Chat is built to grow on demand. Currently on the list:
+AWM Chat is built to grow on demand.
 
-* **Document upload** — attach a document to a message; Claude reads it as input
-* **Image upload** — attach an image; Claude's multimodal blocks
-* **Integration with internal company apps** — pull data or perform actions in other internal systems (RAG-style context injection, or Claude tool/function calling — scoped per integration)
-* **In-app Help page** — surface [`docs/user-manual.md`](docs/user-manual.md) inside the app, linked from the top bar
-* **SPA routing fallback** — `frontend/public/_redirects` with `/*  /index.html  200` so hard refreshes on deep routes always serve the SPA
+Delivered in 0.2.0 (see [`CHANGELOG.md`](CHANGELOG.md)): document upload, image
+upload, video transcription, the in-app Help page, and the SPA routing fallback.
+
+Still on the list:
+
+* **Integration with internal company apps** — pull data or perform actions in other internal systems (RAG-style context injection, or provider tool/function calling — scoped per integration)
 
 Phase 2 items (see [`docs/phase-2.md`](docs/phase-2.md)):
 
