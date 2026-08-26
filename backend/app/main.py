@@ -10,7 +10,7 @@ from .secrets_admin import router as secrets_router
 
 settings = get_settings()
 
-app = FastAPI(title="AWM Chat API", version="0.6.0")
+app = FastAPI(title="AWM Chat API", version="0.6.1")
 
 app.add_middleware(
     CORSMiddleware,

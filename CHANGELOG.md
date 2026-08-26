@@ -8,6 +8,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The frontend and backend share one version number, reported by the backend on
 `GET /` as the FastAPI `version` and set in `frontend/package.json`.
 
+## [0.6.1] - 2026-08-26
+
+Documentation pass, and one live defect found while auditing the docs against
+the code.
+
+### Fixed
+
+- **A key added at runtime could stay invisible until the instance was
+  recycled.** `available_providers()` was `lru_cache`d with no expiry and only
+  cleared in-process. Cloud Run runs several instances, so when a key was saved
+  from the admin page only the instance that handled the write learned about it;
+  every other instance held its stale answer for the rest of its life. The
+  symptom was an agent still showing as Unavailable after its key was
+  successfully saved. It now reads through the TTL-cached secret lookup, so all
+  instances converge within the TTL with no restart.
+
+### Added
+
+- **`backend/tests/test_regression.py`** — 15 checks over the behaviour that
+  regresses invisibly: vendor translation, PDF fidelity switching, the history
+  token budget, cache-prefix stability, runtime key visibility, model resolution
+  and per-agent caps. No pytest dependency, no network. These checks existed
+  during 0.5.0 and 0.6.0 development but were never committed; this makes them
+  repeatable. Not wired into CI, and the HTTP and auth layers remain uncovered.
+
+### Documentation
+
+- **`available_models` is now flagged prominently as an allowlist.** Stored
+  values override code defaults, and entries not in the catalog are dropped
+  silently. After the 0.5.0 upgrade this document still held
+  `['claude-sonnet-4-6', 'gpt-4o']`, so the switcher showed OpenAI alone despite
+  three valid keys — with nothing in any log to explain it.
+- **Corrected a wrong claim about missing secret permissions.** The README said
+  the symptom was a 500 on `POST /chat`; since 0.5.0 the error is swallowed and
+  the real symptom is a silently hidden agent. Added the per-secret IAM binding
+  requirement and the commands to check it — a project-level role is not enough.
+- Documented `HISTORY_TOKEN_BUDGET`, `CONTEXT_WINDOW_MESSAGES` and
+  `MAX_OUTPUT_TOKENS`, which were undocumented after 0.6.0.
+- Added **Known issues, observations and recommendations** to the README,
+  collecting everything known and unfixed in one place: swallowed secret errors,
+  the key panel reporting success and failure at once, quadratic archive
+  rewrites, the in-memory export, OpenAI Tier 1 limits, `MAX_EXTRACTED_CHARS`
+  truncating real documents, the new plaintext copies of client financial data,
+  the missing lockfile, and the untested Python 3.12 target.
+
+### ⚠️ Worth a decision
+
+- The 0.6.0 backfill wrote plaintext extracted text for 56 documents into
+  Firestore, **including client bank statements**. Consistent with existing
+  behaviour for DOCX/TXT and reversible, but an FCA-regulated firm should decide
+  that deliberately rather than find it later.
+
 ## [0.6.0] - 2026-08-20
 
 Cost and context control. A conversation with a report attached was re-sending

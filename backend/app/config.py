@@ -67,9 +67,8 @@ def invalidate_secret_cache(name: str | None = None) -> None:
             _secret_cache.clear()
         else:
             _secret_cache.pop(name, None)
-    # The set of usable agents is derived from which keys resolve, so it has to
-    # be recomputed too or a newly added agent stays greyed out until restart.
-    available_providers.cache_clear()
+    # `available_providers()` reads through the cache cleared above, so it needs
+    # no separate invalidation — that is the point of leaving it uncached.
 
 
 def _get_secret(name: str) -> str:
@@ -181,12 +180,18 @@ def get_settings() -> Settings:
     return Settings()
 
 
-@lru_cache(maxsize=1)
 def available_providers() -> tuple[str, ...]:
-    """Vendors with a usable key, resolved once per process.
+    """Vendors with a usable key.
 
-    Cached because each miss can mean a Secret Manager round trip, and the set
-    of configured keys does not change without a redeploy.
+    Deliberately *not* cached here. It reads through `read_secret_raw`, which is
+    already TTL-cached, so this is cheap — and an unbounded cache at this level
+    was a live bug: the comment used to claim the set "does not change without a
+    redeploy", but keys are added from the admin page at runtime. Cloud Run runs
+    several instances; only the one that handled the write clears its own cache,
+    so any other instance that had already computed this held a stale answer for
+    the rest of its life. The symptom was an agent staying greyed out after its
+    key was saved, until that instance happened to be recycled. Deriving from
+    the TTL-cached read instead means every instance converges within the TTL.
     """
     s = get_settings()
     return tuple(p for p in PROVIDERS if s.has_key_for(p))

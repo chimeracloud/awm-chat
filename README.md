@@ -32,6 +32,15 @@ Which models staff can actually pick is controlled by admins via
 `settings/global.available_models`. An agent whose key is missing is shown
 greyed out in the switcher rather than failing at send time.
 
+> **`available_models` is an allowlist, and stored values override code
+> defaults.** Adding a model to the catalog does *not* make it appear — it must
+> also be in `settings/global.available_models`. Any entry that isn't in the
+> catalog is filtered out silently. After the multi-agent upgrade this document
+> still held `['claude-sonnet-4-6', 'gpt-4o']`; the first was no longer a known
+> model and the second was the only survivor, so the switcher showed OpenAI
+> alone with three valid keys configured and nothing in any log. If an agent is
+> missing from the picker, check this list before checking anything else.
+
 ### One storage format, three agents
 
 **The stored conversation format never changes.** Firestore and the GCS archive
@@ -241,6 +250,9 @@ Multi-agent additions (all optional — sensible defaults apply):
 | `ANTHROPIC_BUDGET_USD` / `OPENAI_BUDGET_USD` / `GOOGLE_BUDGET_USD` | Monthly budget each agent's spend marker is measured against. `0` hides the marker |
 | `GCP_BILLING_EXPORT_TABLE` | BigQuery table of the GCP billing export, e.g. `chiops.billing.gcp_billing_export_v1_XXXX`. Required for the Gemini spend marker — Google has no cost endpoint |
 | `PROVIDER_SPEND_CACHE_SECONDS` | How long vendor spend is cached. Defaults to `300` |
+| `HISTORY_TOKEN_BUDGET` | Hard ceiling on replayed conversation history, in tokens. Defaults to `25000`. This is what actually bounds request size |
+| `CONTEXT_WINDOW_MESSAGES` | Upper bound on messages read from Firestore before the token budget is applied. Defaults to `40` |
+| `MAX_OUTPUT_TOKENS` | Fallback output ceiling. Per-model values in the catalog take precedence — Claude models need a far higher ceiling because thinking counts against it |
 
 Update with:
 
@@ -264,7 +276,22 @@ The service runs as the default compute SA: `991649774709-compute@developer.gser
 | `roles/storage.objectAdmin` | on bucket `awm-chat-archive` | append-only conversation archive |
 | `roles/secretmanager.secretAccessor` | on secrets `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` | read the vendor API keys |
 
-Symptom of a missing `secretAccessor` (or equivalent): a 500 on `POST /chat` with `Permission 'secretmanager.versions.access' denied` in Cloud Run logs.
+**Each secret needs its own binding.** A project-level role is not enough in
+practice — a secret created without an explicit `secretAccessor` binding for the
+service account is writable by the app but not readable back.
+
+**The symptom is silence, not an error.** `_fetch_secret` treats "not
+configured", "disabled" and "permission denied" identically and returns `None`,
+so the agent is simply hidden in the switcher. There is no 500 and nothing in
+the logs. If a key is definitely set but its agent shows as Unavailable, check
+the per-secret IAM binding first:
+
+```bash
+gcloud secrets get-iam-policy GEMINI_API_KEY --project=chiops
+gcloud secrets add-iam-policy-binding GEMINI_API_KEY \
+  --member="serviceAccount:991649774709-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor" --project=chiops
+```
 
 ### Required Firestore indexes
 
@@ -294,6 +321,107 @@ There is no admin-bootstrap script. To grant admin to a user (including the firs
 3. Set field `role` (string) → `admin`
 
 `require_admin` reads this on every request, so it takes effect on the next call. The user may need to sign out and back in (or hard-refresh) for the frontend to unhide the admin UI.
+
+## Known issues, observations and recommendations
+
+Version history is in [`CHANGELOG.md`](CHANGELOG.md).
+
+Everything below is known and unfixed, or fixed but worth remembering. Ordered
+by how likely it is to bite. Nothing here blocks day-to-day use.
+
+### Diagnosability
+
+**A missing secret is indistinguishable from a denied one.** `_fetch_secret`
+catches every exception and returns `None`, so "no key", "disabled key" and
+"permission denied" all present identically: the agent is greyed out, no error,
+nothing in the logs. This cost an afternoon of hunting a Gemini key that was
+perfectly valid — the real cause was a missing per-secret IAM binding.
+*Recommendation:* log the exception type at WARNING and surface "configured but
+unreadable" separately from "not configured" in the admin panel.
+
+**The key panel can report success and failure simultaneously.** Saving a key
+returns `200`, the field clears and the row says "Saved" — then the read-back
+renders "not set", with nothing acknowledging the contradiction. That is exactly
+what the IAM problem above looked like from the UI. *Recommendation:* if a
+save succeeds but the read-back fails, say so explicitly.
+
+### Scale
+
+**The GCS archive is rewritten in full on every message.** `append_to_archive`
+downloads the whole conversation blob, appends one line and re-uploads it, so
+archive cost grows quadratically with conversation length. Fine at current
+volume, and the code says as much — but it is the first thing that will hurt as
+threads get long. *Recommendation:* the Pub/Sub-to-BigQuery path already
+sketched in [`docs/phase-2.md`](docs/phase-2.md).
+
+**The in-app export builds the whole zip in memory** inside one Cloud Run
+request, attachment binaries included. For a heavy account it exhausts the
+container or outruns the timeout, and the browser reports the dead connection as
+"Load failed" — no HTTP error, no message. *Use
+[`tools/export_user_data.py`](backend/tools/export_user_data.py) for large
+accounts*; it streams to disk. *Recommendation:* stream to GCS and hand back a
+signed URL.
+
+### Cost and limits
+
+**OpenAI Tier 1 is 30,000 TPM**, which one real conversation exceeded before the
+0.6.0 context work. Tier 2 (450,000 TPM) needs $50 total paid and 7 days since
+first payment — it cannot be requested manually. Claude and Gemini have far more
+headroom, so the agent switcher is a genuine workaround for a rate-limited user.
+
+**Caching cuts cost, not rate limits.** Cached tokens still count toward TPM.
+Prompt caching is worth having, but it was never going to fix the rate-limit
+error on its own.
+
+**`MAX_EXTRACTED_CHARS` (40,000) truncates real documents.** The backfill hit the
+cap on several live files — a business plan, an application form, a bank
+statement. Those are complete when natively attached on the newest turn, and
+truncated when referenced by text on older turns. Raising the cap trades cost
+back; it is a dial, not a bug.
+
+### Compliance
+
+**Extracted PDF text now sits in Firestore, including client bank statements.**
+The 0.6.0 backfill wrote a plaintext copy of 56 documents' text next to their
+attachment records. This is consistent with how DOCX/TXT always behaved, and the
+same database already holds the conversations discussing them — but it is a new
+plaintext copy of client financial data and an FCA-regulated firm should decide
+that deliberately rather than discover it. Reversible: delete the
+`extracted_text` field on the affected attachments.
+
+### Engineering hygiene
+
+**Regression suite is thin but real.** `backend/tests/test_regression.py` covers
+the behaviour that breaks silently: format translation across all three vendors,
+PDF fidelity switching, the history token budget, cache-prefix stability, runtime
+key visibility, model resolution and per-agent caps. No pytest dependency and no
+network:
+
+```bash
+GCP_PROJECT=chiops PYTHONPATH=backend python backend/tests/test_regression.py
+```
+
+*Recommendation:* it is not wired into CI, and there is no coverage of the HTTP
+layer, auth, or anything that talks to a live vendor.
+
+**No `package-lock.json`.** Cloudflare Pages resolves fresh dependency versions
+on every build, so a transitive update can break a build with no code change.
+
+**The Dockerfile targets Python 3.12; development happened on 3.13.** No
+incompatibility is known, but the deployed interpreter has never been exercised
+locally.
+
+**Model IDs for OpenAI and Gemini were chosen as sensible defaults, not verified
+against account entitlements.** If a model errors, remove it from
+`settings/global.available_models` — no deploy needed.
+
+### Verification status
+
+Structural checks pass for every provider adapter, but **the first live call to
+each vendor is the real test**, along with the first key save through the admin
+panel. Watch `cache_read_tokens` on the `done` event: `0` on the first Claude
+turn is expected (cache write), and it should jump on the next. If it stays `0`,
+caching is not landing.
 
 ## Roadmap
 
